@@ -15,6 +15,10 @@
      ${IDENTITY_CLIENT_ID} (service account annotation), ${EVENTHUBS_NAMESPACE_FQDN} and ${EVENTHUBS_TOPIC}
      (container env vars consumed by the app).
   5. Waits for the rollout, the load balancer IP and a healthy /actuator/health, then prints the endpoint.
+  6. Verifies the passwordless producer (skip with -SkipVerify): waits for readiness, checks that
+     /api/diagnostics reports Spring Cloud Azure's passwordless auto-configuration as applied, then POSTs one
+     probe event to /api/events, retrying with backoff for up to -VerifyTimeoutSeconds (default 360) because
+     Azure role assignments can take up to about five minutes to take effect.
 
   Requires only the Azure CLI (logged in: `az login`) and PowerShell 7.3+. kubectl is installed through
   the Azure CLI (`az aks install-cli`) if it is missing.
@@ -27,7 +31,13 @@ param(
     # Override the auto-detected public IPv4 address (e.g. when behind a proxy).
     [string] $CallerIp,
     # Rebuild the image even if a tag for the current sources already exists in ACR.
-    [switch] $ForceBuild
+    [switch] $ForceBuild,
+    # Skip the post-deploy verification (readiness, diagnostics and one probe event through Event Hubs).
+    [switch] $SkipVerify,
+    # How long the verification keeps retrying the probe event. Role assignments can take up to ~5 minutes to
+    # take effect, so the default leaves a margin above that.
+    [ValidateRange(60, 3600)]
+    [int] $VerifyTimeoutSeconds = 360
 )
 
 Set-StrictMode -Version Latest
@@ -98,6 +108,72 @@ function Invoke-WithRetry([scriptblock] $Action, [string] $What, [int] $Attempts
             Start-Sleep -Seconds $DelaySeconds
         }
     }
+}
+
+function Test-PasswordlessProducer([string] $Endpoint, [int] $TimeoutSeconds) {
+    # Bounded post-deploy verification of the passwordless producer. Throws with a clear message on failure.
+
+    Write-Step 'Verifying: readiness'
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    $ready = $false
+    while (-not $ready -and [DateTime]::UtcNow -lt $deadline) {
+        try { $ready = ((Invoke-RestMethod -Uri "$Endpoint/actuator/health/readiness" -TimeoutSec 10).status -eq 'UP') }
+        catch { Write-Verbose "readiness probe failed: $($_.Exception.Message)" }
+        if (-not $ready) { Start-Sleep -Seconds 5 }
+    }
+    if (-not $ready) { throw "Verification failed: $Endpoint/actuator/health/readiness was not UP within 2 minutes." }
+    Write-Host '  readiness: UP'
+
+    Write-Step 'Verifying: effective Kafka client configuration (/api/diagnostics)'
+    $diag = Invoke-RestMethod -Uri "$Endpoint/api/diagnostics" -TimeoutSec 30
+    $kafka = $diag.kafka
+    Write-Host ("  securityProtocol={0}  saslMechanism={1}" -f $kafka.securityProtocol, $kafka.saslMechanism)
+    Write-Host ("  loginCallbackHandlerClass={0}" -f $kafka.loginCallbackHandlerClass)
+    Write-Host ("  passwordlessAutoConfigApplied={0}  credentialPropertiesConfigured={1}" -f $kafka.passwordlessAutoConfigApplied, $kafka.credentialPropertiesConfigured)
+    if (-not $kafka.passwordlessAutoConfigApplied) {
+        # A configuration problem, not role propagation: retrying cannot fix it.
+        throw "Verification failed: Spring Cloud Azure's passwordless auto-configuration is NOT applied. Problems: $($kafka.problems -join '; ')"
+    }
+    if ($kafka.credentialPropertiesConfigured) {
+        throw "Verification failed: credential properties are configured ($($kafka.credentialPropertyNames -join ', ')); the PoC must be passwordless."
+    }
+
+    Write-Step "Verifying: probe event through Event Hubs (retrying up to $TimeoutSeconds s for role-assignment propagation)"
+    $body = @{ message = 'deploy-probe'; source = 'api' } | ConvertTo-Json -Compress
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $delay = 10
+    $attempt = 0
+    $last = 'no response'
+    while ($true) {
+        $attempt++
+        $status = 0
+        $resp = $null
+        try {
+            $resp = Invoke-RestMethod -Method Post -Uri "$Endpoint/api/events" -ContentType 'application/json' -Body $body `
+                -TimeoutSec 60 -SkipHttpErrorCheck -StatusCodeVariable status
+        }
+        catch { $last = "request failed: $($_.Exception.Message)" }
+
+        if ($status -ge 200 -and $status -lt 300) {
+            Write-Host ("  probe event {0} acknowledged by Event Hubs: topic={1} partition={2} offset={3} (attempt {4})" -f `
+                $resp.event.id, $resp.topic, $resp.partition, $resp.offset, $attempt) -ForegroundColor Green
+            return
+        }
+        if ($status -ge 400 -and $status -lt 500) {
+            throw "Verification failed: the app rejected the probe event with HTTP $status ($($resp | ConvertTo-Json -Compress)). This is not role propagation."
+        }
+        if ($status -ne 0) { $last = "HTTP $status $($resp | ConvertTo-Json -Compress)" }
+
+        $remaining = [int]($deadline - [DateTime]::UtcNow).TotalSeconds
+        if ($remaining -le 0) { break }
+        $wait = [Math]::Min($delay, [Math]::Max($remaining, 1))
+        Write-Host "  attempt $attempt failed ($last). Retrying in ${wait}s ($remaining s left)..." -ForegroundColor Yellow
+        Start-Sleep -Seconds $wait
+        $delay = [Math]::Min($delay * 2, 30)
+    }
+    throw ("Verification failed: no probe event was acknowledged within $TimeoutSeconds s. Last result: $last. " +
+        'Role assignments for the workload identity can take up to five minutes to take effect, so re-run with a longer ' +
+        '-VerifyTimeoutSeconds, or inspect: kubectl -n poc logs deploy/ehpoc, and ' + "$Endpoint/api/diagnostics.")
 }
 
 # ---------------------------------------------------------------- preflight
@@ -246,3 +322,12 @@ if (-not $healthy) { throw "Health endpoint at $endpoint did not report UP withi
 Write-Host "`nDeployed. Endpoint (reachable only from $CallerIp):" -ForegroundColor Green
 Write-Host "  $endpoint/actuator/health"
 Write-Host "  $endpoint/api/diagnostics"
+Write-Host "  POST $endpoint/api/events   {`"message`":`"hello`"}"
+
+if ($SkipVerify) {
+    Write-Host "`nSkipping verification (-SkipVerify)." -ForegroundColor Yellow
+}
+else {
+    Test-PasswordlessProducer -Endpoint $endpoint -TimeoutSeconds $VerifyTimeoutSeconds
+    Write-Host "`nVerified: the app published an event to Event Hubs with no secret." -ForegroundColor Green
+}
