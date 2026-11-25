@@ -1,17 +1,19 @@
 #Requires -Version 7.3
 <#
 .SYNOPSIS
-  Deploys the passwordless Event Hubs PoC base environment (ticket 01) from an empty resource group
+  Deploys the passwordless Event Hubs PoC environment (tickets 01-02) from an empty resource group
   to a running app, and prints the endpoint. Safe to re-run (idempotent).
 
 .DESCRIPTION
   1. Detects the caller's public IP once (or uses -CallerIp).
-  2. Creates the resource group and deploys infra/main.bicep (VNet, ACR, AKS). The IP becomes the
-     AKS API server authorized range.
+  2. Creates the resource group and deploys infra/main.bicep (VNet, ACR, AKS, private Event Hubs, workload
+     identity). The IP becomes the AKS API server authorized range.
   3. Builds the app image remotely with `az acr build` (no local Java/Maven/Docker). The tag is a hash of
      the app sources, so an unchanged app is not rebuilt.
-  4. Fetches kubeconfig into .deploy-state/ (your ~/.kube is not touched) and applies k8s/ with the IP
-     rendered into the Service loadBalancerSourceRanges.
+  4. Fetches kubeconfig into .deploy-state/ (your ~/.kube is not touched) and applies k8s/ with these
+     placeholders rendered (all non-secret): ${IMAGE}, ${CALLER_IP} (Service source range),
+     ${IDENTITY_CLIENT_ID} (service account annotation), ${EVENTHUBS_NAMESPACE_FQDN} and ${EVENTHUBS_TOPIC}
+     (container env vars consumed by the app).
   5. Waits for the rollout, the load balancer IP and a healthy /actuator/health, then prints the endpoint.
 
   Requires only the Azure CLI (logged in: `az login`) and PowerShell 7.3+. kubectl is installed through
@@ -75,6 +77,18 @@ function Get-AppHash {
     return ([BitConverter]::ToString($sha.Hash) -replace '-', '').Substring(0, 12).ToLowerInvariant()
 }
 
+function Expand-Manifest([string] $Path, [System.Collections.IDictionary] $Values) {
+    # Replaces ${NAME} placeholders and fails if any placeholder is left unfilled or unknown.
+    $text = Get-Content -Raw -Path $Path
+    foreach ($key in $Values.Keys) {
+        if ([string]::IsNullOrWhiteSpace([string]$Values[$key])) { throw "Empty value for manifest placeholder $key." }
+        $text = $text.Replace('${' + $key + '}', [string]$Values[$key])
+    }
+    $left = [regex]::Matches($text, '\$\{[A-Z_]+\}') | ForEach-Object { $_.Value } | Sort-Object -Unique
+    if ($left) { throw "Unfilled placeholder(s) in $(Split-Path -Leaf $Path): $($left -join ', ')" }
+    return $text
+}
+
 function Invoke-WithRetry([scriptblock] $Action, [string] $What, [int] $Attempts = 12, [int] $DelaySeconds = 15) {
     for ($i = 1; $i -le $Attempts; $i++) {
         try { return & $Action }
@@ -93,7 +107,7 @@ try { $null = az account show -o none } catch { throw 'Not logged in to Azure. R
 Write-Host "Subscription: $(az account show --query name -o tsv)"
 
 # Resource providers a fresh subscription may not have registered yet (no-op when already registered).
-foreach ($ns in 'Microsoft.ContainerService', 'Microsoft.ContainerRegistry', 'Microsoft.Network', 'Microsoft.Compute') {
+foreach ($ns in 'Microsoft.ContainerService', 'Microsoft.ContainerRegistry', 'Microsoft.Network', 'Microsoft.Compute', 'Microsoft.EventHub', 'Microsoft.ManagedIdentity') {
     if ((az provider show --namespace $ns --query registrationState -o tsv) -ne 'Registered') {
         Write-Host "Registering resource provider $ns (waits until done)..."
         az provider register --namespace $ns --wait
@@ -119,7 +133,7 @@ Write-Host "Using $CallerIp for the AKS API server authorized range and the Serv
 Write-Step "Resource group $ResourceGroup ($Location)"
 az group create --name $ResourceGroup --location $Location --tags purpose=eventhubs-passwordless-poc -o none
 
-Write-Step 'Deploying infra/main.bicep (VNet, ACR, AKS). AKS creation takes several minutes on first run.'
+Write-Step 'Deploying infra/main.bicep (VNet, ACR, AKS, private Event Hubs, workload identity). AKS creation takes several minutes on first run.'
 $outputsJson = az deployment group create `
     --resource-group $ResourceGroup `
     --name 'ehpoc-base' `
@@ -130,7 +144,14 @@ $out = $outputsJson | ConvertFrom-Json
 $acrName = $out.acrName.value
 $acrLoginServer = $out.acrLoginServer.value
 $aksName = $out.aksName.value
+$eventHubsNamespace = $out.eventHubsNamespaceName.value
+$eventHubsFqdn = $out.eventHubsFqdn.value
+$eventHubName = $out.eventHubName.value
+$identityClientId = $out.identityClientId.value
+$tenantId = $out.tenantId.value
+$identityPrincipalId = $out.identityPrincipalId.value
 Write-Host "ACR: $acrLoginServer   AKS: $aksName"
+Write-Host "Event Hubs: $eventHubsFqdn (event hub '$eventHubName')   Identity client ID: $identityClientId"
 
 # ---------------------------------------------------------------- image (remote build)
 Write-Step 'Application image'
@@ -164,9 +185,17 @@ Invoke-WithRetry -What 'get-credentials' -Action {
 Write-Host "kubeconfig: $kubeconfig  (use: `$env:KUBECONFIG = '$kubeconfig')"
 
 Write-Step 'Applying manifests'
+# Placeholders in k8s/*.yaml. Only non-secret values: no secret exists anywhere in the manifests.
+$manifestValues = [ordered]@{
+    IMAGE                    = $image
+    CALLER_IP                = $CallerIp
+    IDENTITY_CLIENT_ID       = $identityClientId
+    EVENTHUBS_NAMESPACE_FQDN = $eventHubsFqdn
+    EVENTHUBS_TOPIC          = $eventHubName
+}
 $manifestFiles = Get-ChildItem -Path (Join-Path $repoRoot 'k8s') -Filter '*.yaml' | Sort-Object Name
 foreach ($m in $manifestFiles) {
-    $rendered = (Get-Content -Raw -Path $m.FullName).Replace('${IMAGE}', $image).Replace('${CALLER_IP}', $CallerIp)
+    $rendered = Expand-Manifest -Path $m.FullName -Values $manifestValues
     Invoke-WithRetry -What "kubectl apply $($m.Name)" -Action { $rendered | kubectl apply -f - }
 }
 
@@ -196,13 +225,22 @@ if (-not $healthy) { throw "Health endpoint at $endpoint did not report UP withi
 # State for later scripts (smoke test etc.). Gitignored; contains your IP, no secrets.
 [ordered]@{
     resourceGroup = $ResourceGroup
-    location      = $Location
-    acrName       = $acrName
-    aksName       = $aksName
-    image         = $image
-    callerIp      = $CallerIp
-    endpoint      = $endpoint
-    kubeconfig    = $kubeconfig
+    location = $Location
+    acrName = $acrName
+    aksName = $aksName
+    image = $image
+    callerIp = $CallerIp
+    endpoint = $endpoint
+    kubeconfig = $kubeconfig
+    namespace = $namespace
+    eventHubsNamespace = $eventHubsNamespace
+    eventHubsFqdn = $eventHubsFqdn
+    eventHubName = $eventHubName
+    identityName = $out.identityName.value
+    identityClientId = $identityClientId
+    identityPrincipalId = $identityPrincipalId
+    tenantId = $tenantId
+    serviceAccount = 'ehpoc'
 } | ConvertTo-Json | Set-Content -Path (Join-Path $stateDir 'deploy-outputs.json')
 
 Write-Host "`nDeployed. Endpoint (reachable only from $CallerIp):" -ForegroundColor Green
