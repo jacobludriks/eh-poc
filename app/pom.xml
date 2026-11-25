@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- Pinned per the spec: Spring Boot 4.1.2 (do NOT move to 4.2.x, outside Spring Cloud Azure 7.5.0's tested range). -->
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.1.2</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.example</groupId>
+  <artifactId>ehpoc</artifactId>
+  <version>0.0.1-SNAPSHOT</version>
+  <name>ehpoc</name>
+  <description>Passwordless Spring Kafka to Azure Event Hubs on AKS (proof of concept)</description>
+
+  <properties>
+    <java.version>21</java.version>
+    <!-- Fallback if the Kafka 4.2.x client is incompatible with Azure's handler: Boot 3.5.x + Spring Cloud Azure 6.6.0 -->
+    <spring-cloud-azure.version>7.5.0</spring-cloud-azure.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.azure.spring</groupId>
+        <artifactId>spring-cloud-azure-dependencies</artifactId>
+        <version>${spring-cloud-azure.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- Boot 4 starter names: spring-boot-starter-webmvc (not "-web", which is a legacy alias) and spring-boot-starter-actuator. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-webmvc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <!-- Ticket 03 adds: com.azure.spring:spring-cloud-azure-starter (version from the BOM above)
+         and org.springframework.boot:spring-boot-starter-kafka (the Boot 4 Kafka starter; exists on Maven Central at 4.1.2). -->
+  </dependencies>
+
+  <build>
+    <finalName>app</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>
