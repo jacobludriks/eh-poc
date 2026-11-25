@@ -4,6 +4,40 @@ spring:
   lifecycle:
     timeout-per-shutdown-phase: 20s
 
+  kafka:
+    # Event Hubs Kafka endpoint: the public namespace name (never the privatelink name or an IP; the OAuth scope
+    # derives from it), port 9093, exactly ONE server. Anything else silently disables Spring Cloud Azure's
+    # passwordless auto-configuration, which /api/diagnostics reports (kafka.passwordlessAutoConfigApplied).
+    # The empty default only keeps the app (and diagnostics) up when the variable is missing; sends then fail.
+    bootstrap-servers: ${EVENTHUBS_NAMESPACE_FQDN:}:9093
+    # Deliberately NO security, sasl, jaas, credential or managed-identity settings here: the base Spring Cloud
+    # Azure starter adds SASL_SSL + OAUTHBEARER + its callback handler, and the credential chain resolves the
+    # workload identity from the webhook-injected AZURE_* environment variables.
+    properties:
+      # Event Hubs recommended client tuning: keep idle and metadata ages below the 240 s service idle limit.
+      "[metadata.max.age.ms]": 180000
+      "[connections.max.idle.ms]": 180000
+    producer:
+      compression-type: none
+      properties:
+        "[request.timeout.ms]": 60000
+        "[max.request.size]": 1000000
+        # Bounds how long send() blocks on login/metadata, so an unreachable or unauthorised hub fails fast
+        # (kept below the HTTP-level acknowledgement wait in EventPublisher).
+        "[max.block.ms]": 20000
+    consumer:
+      # Config only for now; the consumer lands in ticket 04.
+      properties:
+        "[session.timeout.ms]": 30000
+    admin:
+      # Topics cannot be created over the Kafka protocol on Event Hubs, and nothing declares a NewTopic.
+      fail-fast: false
+
+# The event hub (= Kafka topic), created by Bicep.
+ehpoc:
+  eventhubs:
+    topic: ${EVENTHUBS_TOPIC:events}
+
 server:
   port: 8080
   shutdown: graceful

@@ -46,8 +46,17 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-actuator</artifactId>
     </dependency>
-    <!-- Ticket 03 adds: com.azure.spring:spring-cloud-azure-starter (version from the BOM above)
-         and org.springframework.boot:spring-boot-starter-kafka (the Boot 4 Kafka starter; exists on Maven Central at 4.1.2). -->
+    <!-- Passwordless Kafka: the base Spring Cloud Azure starter auto-configures Azure's OAUTHBEARER callback
+         handler for spring-kafka (there is no dedicated Kafka starter). Version comes from the BOM above. -->
+    <dependency>
+      <groupId>com.azure.spring</groupId>
+      <artifactId>spring-cloud-azure-starter</artifactId>
+    </dependency>
+    <!-- The Boot 4 Kafka starter (spring-kafka plus Boot's Kafka auto-configuration). -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-kafka</artifactId>
+    </dependency>
   </dependencies>
 
   <build>
