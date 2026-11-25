@@ -14,7 +14,8 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * Diagnostics endpoint. Reports, from inside the running pod, the facts that prove the private,
  * passwordless wiring: where the Event Hubs host resolves, whether that address is private, and whether the
- * workload identity environment was injected. Ticket 03 adds the Kafka/SASL/auto-configuration facts.
+ * workload identity environment was injected, and (the "kafka" section) the effective Kafka client security
+ * configuration and whether Spring Cloud Azure's passwordless auto-configuration took effect.
  *
  * <p>Never reports token contents or any secret: workload identity variables are reported as booleans only.
  */
@@ -25,9 +26,11 @@ public class DiagnosticsController {
     static final int KAFKA_PORT = 9093;
 
     private final Environment env;
+    private final KafkaDiagnostics kafkaDiagnostics;
 
-    public DiagnosticsController(Environment env) {
+    public DiagnosticsController(Environment env, KafkaDiagnostics kafkaDiagnostics) {
         this.env = env;
+        this.kafkaDiagnostics = kafkaDiagnostics;
     }
 
     @GetMapping("/api/diagnostics")
@@ -39,6 +42,7 @@ public class DiagnosticsController {
         body.put("time", Instant.now().toString());
         body.put("eventHubs", eventHubs());
         body.put("workloadIdentity", workloadIdentity());
+        body.put("kafka", kafkaDiagnostics.report());
         return body;
     }
 
