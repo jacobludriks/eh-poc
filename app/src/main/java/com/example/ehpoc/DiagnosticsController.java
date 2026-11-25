@@ -28,9 +28,13 @@ public class DiagnosticsController {
     private final Environment env;
     private final KafkaDiagnostics kafkaDiagnostics;
 
-    public DiagnosticsController(Environment env, KafkaDiagnostics kafkaDiagnostics) {
+    private final ConsumerDiagnostics consumerDiagnostics;
+
+    public DiagnosticsController(Environment env, KafkaDiagnostics kafkaDiagnostics,
+            ConsumerDiagnostics consumerDiagnostics) {
         this.env = env;
         this.kafkaDiagnostics = kafkaDiagnostics;
+        this.consumerDiagnostics = consumerDiagnostics;
     }
 
     @GetMapping("/api/diagnostics")
@@ -43,6 +47,7 @@ public class DiagnosticsController {
         body.put("eventHubs", eventHubs());
         body.put("workloadIdentity", workloadIdentity());
         body.put("kafka", kafkaDiagnostics.report());
+        body.put("consumer", consumerDiagnostics.report());
         return body;
     }
 
