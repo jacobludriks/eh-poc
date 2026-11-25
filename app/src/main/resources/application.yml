@@ -26,9 +26,22 @@ spring:
         # (kept below the HTTP-level acknowledgement wait in EventPublisher).
         "[max.block.ms]": 20000
     consumer:
-      # Config only for now; the consumer lands in ticket 04.
+      # Kafka consumer group "dashboard" (auto-created by Event Hubs; no Event Hubs consumer-group resource needed).
+      group-id: dashboard
+      # A group with no committed offset starts at the end; with committed offsets a restart resumes, not replays.
+      auto-offset-reset: latest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       properties:
         "[session.timeout.ms]": 30000
+    listener:
+      # Offsets are committed by the container (the app never commits manually), at most about once a second:
+      # Event Hubs throttles consumer-group offset commits to 2 per second per partition.
+      ack-mode: time
+      ack-time: 1s
+      # If the broker rejects the identity (token refused, or the role assignment has not propagated yet), keep
+      # the consumer and retry every 10 s instead of stopping it; the failure is shown in /api/diagnostics.
+      auth-exception-retry-interval: 10s
     admin:
       # Topics cannot be created over the Kafka protocol on Event Hubs, and nothing declares a NewTopic.
       fail-fast: false
@@ -37,6 +50,9 @@ spring:
 ehpoc:
   eventhubs:
     topic: ${EVENTHUBS_TOPIC:events}
+  sse:
+    # Comment line sent to every open event stream so idle intermediaries do not drop the connection.
+    heartbeat-interval: 15s
 
 server:
   port: 8080
