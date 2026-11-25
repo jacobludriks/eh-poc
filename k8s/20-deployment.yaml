@@ -1,0 +1,53 @@
+# Rendered by scripts/deploy.ps1: ${IMAGE} is replaced with the ACR image reference.
+# Nothing secret here and no image-pull credential: the kubelet identity pulls from ACR (AcrPull).
+# Ticket 02 adds the label azure.workload.identity/use: "true" on the pod template and the
+# AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential env var.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ehpoc
+  namespace: poc
+  labels:
+    app: ehpoc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ehpoc
+  template:
+    metadata:
+      labels:
+        app: ehpoc
+    spec:
+      serviceAccountName: ehpoc
+      containers:
+        - name: app
+          image: "${IMAGE}"
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
