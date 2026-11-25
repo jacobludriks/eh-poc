@@ -57,6 +57,20 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-kafka</artifactId>
     </dependency>
+
+    <!-- TEST SCOPE ONLY. Local verification harness: an in-process PLAINTEXT Kafka broker (EmbeddedKafka) used to
+         exercise the consumer, buffer, SSE and clear behaviour without Azure. Not in the application jar and
+         never reachable from the deployed configuration (which stays SASL_SSL via Spring Cloud Azure). -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka-test</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
