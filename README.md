@@ -168,7 +168,9 @@ Both had passed every local test, because the fakes did not model them:
 - The container registry is public (Basic tier), and the AKS API server is public but restricted to your IP. Only the
   Event Hubs path is fully private.
 - "Clear view" empties the dashboard's in-memory buffer only. Event Hubs keeps events until retention (1 day) expires.
-- Not tested: `destroy.ps1`, a change of your public IP between runs, and any test that the load balancer rejects
-  other source IPs (that would need a second network).
-- The environment is left running after the tests. It costs a little each day, so run `scripts/destroy.ps1` when you
-  are done.
+- Not tested: a change of your public IP between runs, and any test that the load balancer rejects other source IPs
+  (that would need a second network).
+- **Teardown:** the deployment was destroyed after the tests with `scripts/destroy.ps1 -Force`. It deleted the
+  resource group, including the AKS node resource group, with nothing left behind, and removed the local
+  `.deploy-state/` folder. The results above are from that deployment and are not reproducible without redeploying
+  (about 15 to 25 minutes with `scripts/deploy.ps1`, then `scripts/smoke-test.ps1`).
