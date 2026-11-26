@@ -100,7 +100,7 @@ public class EventsController {
     @ExceptionHandler(EventPublishException.class)
     ResponseEntity<Map<String, Object>> publishFailed(EventPublishException e) {
         Map<String, Object> body = errorBody("publish_failed", e.getMessage());
-        body.put("reason", e.reason());
+        body.put("reason", e.reason().value());
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(body);
     }
 

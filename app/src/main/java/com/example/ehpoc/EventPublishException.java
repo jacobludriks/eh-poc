@@ -8,15 +8,15 @@ package com.example.ehpoc;
  */
 public class EventPublishException extends RuntimeException {
 
-    private final String reason;
+    private final PublishFailureReason reason;
 
-    public EventPublishException(String reason, String message, Throwable cause) {
+    public EventPublishException(PublishFailureReason reason, String message, Throwable cause) {
         super(message, cause);
         this.reason = reason;
     }
 
-    /** One of {@code timeout}, {@code authentication}, {@code authorization}, {@code unavailable}. */
-    public String reason() {
+    /** The coarse category; its {@link PublishFailureReason#value() wire value} is returned to API clients. */
+    public PublishFailureReason reason() {
         return reason;
     }
 }

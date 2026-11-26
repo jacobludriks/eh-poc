@@ -55,11 +55,11 @@ public class EventPublisher {
         }
         catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new EventPublishException("unavailable", "Publishing was interrupted.", e);
+            throw new EventPublishException(PublishFailureReason.UNAVAILABLE, "Publishing was interrupted.", e);
         }
         catch (TimeoutException e) {
             log.warn("Publish to '{}' not acknowledged within {}s", topic, ACK_TIMEOUT_SECONDS);
-            throw new EventPublishException("timeout",
+            throw new EventPublishException(PublishFailureReason.TIMEOUT,
                     "Event Hubs did not acknowledge the event within " + ACK_TIMEOUT_SECONDS + " seconds.", e);
         }
         catch (ExecutionException | RuntimeException e) {
@@ -71,29 +71,11 @@ public class EventPublisher {
 
     /** Maps a failure to a coarse, safe description by class name only; the full exception is logged, not returned. */
     static EventPublishException classify(Throwable failure) {
-        String chain = "";
-        String reason = "unavailable";
+        StringBuilder chain = new StringBuilder();
         for (Throwable t = failure; t != null; t = t.getCause()) {
-            String name = t.getClass().getName();
-            chain = chain.isEmpty() ? t.getClass().getSimpleName() : chain + " <- " + t.getClass().getSimpleName();
-            if (reason.equals("unavailable")) {
-                if (name.contains("Authorization")) {
-                    reason = "authorization";
-                }
-                else if (name.contains("Authentication") || name.contains("CredentialUnavailable") || name.contains("LoginException")) {
-                    reason = "authentication";
-                }
-                else if (name.contains("Timeout")) {
-                    reason = "timeout";
-                }
-            }
+            chain.append(chain.isEmpty() ? "" : " <- ").append(t.getClass().getSimpleName());
         }
-        String description = switch (reason) {
-            case "authentication" -> "Authentication to Event Hubs failed (workload identity token not obtained or rejected).";
-            case "authorization" -> "Event Hubs rejected the identity as not authorised to send. Role assignments can take up to five minutes to take effect.";
-            case "timeout" -> "Event Hubs could not be reached in time.";
-            default -> "Event Hubs is unavailable.";
-        };
-        return new EventPublishException(reason, description + " (" + chain + ")", failure);
+        PublishFailureReason reason = PublishFailureReason.of(failure);
+        return new EventPublishException(reason, reason.description() + " (" + chain + ")", failure);
     }
 }
