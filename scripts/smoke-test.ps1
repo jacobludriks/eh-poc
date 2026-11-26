@@ -151,7 +151,12 @@ function Invoke-Api {
     try { $r = Invoke-WebRequest @params }
     catch { return [pscustomobject]@{ Status = 0; Json = $null; Error = $_.Exception.Message } }
     $json = $null
-    try { if ($r.Content) { $json = $r.Content | ConvertFrom-Json } } catch { Write-Verbose "non-JSON body from $Path" }
+    # PowerShell returns Content as byte[] for content types it does not recognise as text, e.g. Spring Boot's
+    # actuator type application/vnd.spring-boot.actuator.v3+json (found on the first live run), so decode it.
+    try {
+        $text = if ($r.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($r.Content) } else { [string]$r.Content }
+        if ($text) { $json = $text | ConvertFrom-Json }
+    } catch { Write-Verbose "non-JSON body from $Path" }
     [pscustomobject]@{ Status = [int]$r.StatusCode; Json = $json; Error = $null }
 }
 

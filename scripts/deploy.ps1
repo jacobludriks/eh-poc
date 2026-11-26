@@ -310,11 +310,13 @@ if ($exists) {
 }
 else {
     Write-Host "Building $image in ACR (compiles the app inside the image; no local toolchain)..."
-    # The source directory is the app folder, so the Dockerfile is addressed relative to it (an absolute local
-    # path would not exist inside the remote build context).
+    # Run from the app folder with '.' as the source: the Azure CLI resolves --file against the current
+    # directory, so '--file Dockerfile <absolute app path>' from the repo root fails with
+    # "Unable to find 'Dockerfile'" (found on the first real deploy).
     $buildLog = [System.Collections.Generic.List[string]]::new()
+    Push-Location (Join-Path $repoRoot 'app')
     try {
-        az acr build --registry $acrName --image "${imageRepo}:$tag" --file Dockerfile (Join-Path $repoRoot 'app') 2>&1 |
+        az acr build --registry $acrName --image "${imageRepo}:$tag" --file Dockerfile . 2>&1 |
             ForEach-Object { $line = "$_"; $buildLog.Add($line); Write-Host $line }
     }
     catch {
@@ -322,6 +324,7 @@ else {
         if ($hint) { throw $hint }
         throw
     }
+    finally { Pop-Location }
 }
 
 # ---------------------------------------------------------------- Kubernetes

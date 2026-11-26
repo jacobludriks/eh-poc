@@ -114,7 +114,7 @@ public sealed class FakeEventsApp : IDisposable
             {
                 bool down;
                 lock (gate) { down = readinessCalls++ < ReadinessDownCalls; }
-                Json(res, down ? 503 : 200, down ? "{\"status\":\"DOWN\"}" : "{\"status\":\"UP\"}");
+                Json(res, down ? 503 : 200, down ? "{\"status\":\"DOWN\"}" : "{\"status\":\"UP\"}", "application/vnd.spring-boot.actuator.v3+json");
             }
             else if (req.HttpMethod == "GET" && path == "/api/diagnostics")
             {
@@ -311,11 +311,11 @@ public sealed class FakeEventsApp : IDisposable
         res.OutputStream.Flush();
     }
 
-    static void Json(HttpListenerResponse res, int status, string body)
+    static void Json(HttpListenerResponse res, int status, string body, string contentType = "application/json")
     {
         var bytes = Encoding.UTF8.GetBytes(body ?? "{}");
         res.StatusCode = status;
-        res.ContentType = "application/json";
+        res.ContentType = contentType;
         res.ContentLength64 = bytes.Length;
         res.OutputStream.Write(bytes, 0, bytes.Length);
         res.Close();
