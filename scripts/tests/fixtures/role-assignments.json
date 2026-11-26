@@ -1,0 +1,12 @@
+[
+  {
+    "principalId": "00000000-0000-0000-0000-0000000000aa",
+    "roleDefinitionName": "Azure Event Hubs Data Sender",
+    "scope": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-test/providers/Microsoft.EventHub/namespaces/ehpoc-ns-test/eventhubs/events"
+  },
+  {
+    "principalId": "00000000-0000-0000-0000-0000000000aa",
+    "roleDefinitionName": "Azure Event Hubs Data Receiver",
+    "scope": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-test/providers/Microsoft.EventHub/namespaces/ehpoc-ns-test/eventhubs/events"
+  }
+]
