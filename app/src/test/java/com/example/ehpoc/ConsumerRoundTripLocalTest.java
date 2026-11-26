@@ -241,6 +241,21 @@ class ConsumerRoundTripLocalTest {
         return URI.create("http://localhost:" + port + path);
     }
 
+    @Test
+    void dashboardPageIsServedAtRootAsOneSelfContainedPageUsingTheDocumentedApi() throws Exception {
+        HttpResponse<String> page = http.send(HttpRequest.newBuilder(uri("/")).GET().build(), HttpResponse.BodyHandlers.ofString());
+
+        assertThat(page.statusCode()).isEqualTo(200);
+        assertThat(page.headers().firstValue("Content-Type").orElse("")).startsWith("text/html");
+        String html = page.body();
+        // Works offline from the app: nothing is loaded from another origin.
+        assertThat(html).doesNotContainPattern("(?i)(src|href)\\s*=\\s*[\"']?(https?:)?//");
+        // Untrusted event data must never reach innerHTML.
+        assertThat(html).doesNotContain("innerHTML").doesNotContain("insertAdjacentHTML").doesNotContain("document.write");
+        // It talks to exactly the documented endpoints.
+        assertThat(html).contains("/api/events", "/api/events/stream", "/api/events/clear", "/api/diagnostics");
+    }
+
     private JsonNode get(String path) throws Exception {
         HttpResponse<String> response = http.send(HttpRequest.newBuilder(uri(path)).GET().build(), HttpResponse.BodyHandlers.ofString());
         assertThat(response.statusCode()).isEqualTo(200);

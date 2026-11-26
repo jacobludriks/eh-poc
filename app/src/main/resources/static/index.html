@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Everything is inline and same-origin: the page must work offline from the app, with no CDN or other origin. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<title>Event Hubs passwordless PoC</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --surface: #ffffff;
+    --text: #1b1f24;
+    --muted: #4b5563;
+    --border: #c5ccd6;
+    --accent: #0b5cad;
+    --accent-text: #ffffff;
+    --focus: #0b5cad;
+    --ok-bg: #d9f2e0;   --ok-text: #0b4a1f;
+    --warn-bg: #fdecc8; --warn-text: #5c3a00;
+    --bad-bg: #fbd9d9;  --bad-text: #7a1010;
+    --new-row: #e3efff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12161b;
+      --surface: #1c222a;
+      --text: #e8ebef;
+      --muted: #aab3bf;
+      --border: #3a4552;
+      --accent: #6cb2ff;
+      --accent-text: #08121f;
+      --focus: #8cc4ff;
+      --ok-bg: #12391f;   --ok-text: #a6e9b9;
+      --warn-bg: #44330a; --warn-text: #fbd98b;
+      --bad-bg: #4a1a1a;  --bad-text: #ffb9b9;
+      --new-row: #1d3350;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 72rem; margin: 0 auto; padding: 1rem; display: grid; gap: 1rem; }
+  main > * { min-width: 0; }
+  h1 { font-size: 1.4rem; margin: 0; }
+  h2 { font-size: 1.1rem; margin: 0 0 .75rem; }
+  .sub { margin: .25rem 0 0; color: var(--muted); }
+  section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: .5rem;
+    padding: 1rem;
+  }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  label { display: block; font-weight: 600; margin-bottom: .25rem; }
+  input[type=text] {
+    width: 100%;
+    padding: .55rem .65rem;
+    font: inherit;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: .35rem;
+  }
+  button {
+    font: inherit;
+    font-weight: 600;
+    padding: .55rem 1rem;
+    border-radius: .35rem;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--accent-text);
+    cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .6; cursor: progress; }
+  .row { display: flex; gap: .75rem; align-items: flex-end; flex-wrap: wrap; }
+  .row > .grow { flex: 1 1 16rem; }
+  .hint { color: var(--muted); font-size: .9rem; margin: .5rem 0 0; }
+  .result { margin: .75rem 0 0; padding: .5rem .75rem; border-radius: .35rem; }
+  .result:empty { display: none; }
+  .badge {
+    display: inline-block;
+    padding: .05rem .55rem;
+    border-radius: 999px;
+    font-size: .85rem;
+    font-weight: 600;
+    border: 1px solid transparent;
+  }
+  .ok   { background: var(--ok-bg);   color: var(--ok-text);   border-color: var(--ok-text); }
+  .warn { background: var(--warn-bg); color: var(--warn-text); border-color: var(--warn-text); }
+  .bad  { background: var(--bad-bg);  color: var(--bad-text);  border-color: var(--bad-text); }
+  .banner { padding: .5rem .75rem; border-radius: .35rem; margin-bottom: .75rem; }
+  .banner:empty { display: none; }
+  dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: .75rem 1.5rem; margin: 0; }
+  dl > div { min-width: 0; }
+  dt { color: var(--muted); font-size: .85rem; }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  ul.problems { margin: .25rem 0 0; padding-left: 1.2rem; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center; justify-content: space-between; margin-bottom: .75rem; }
+  .toolbar h2 { margin: 0; }
+  .toolbar .actions { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center; }
+  .scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: .35rem; }
+  table { border-collapse: collapse; width: 100%; min-width: 40rem; }
+  caption { text-align: left; padding: .5rem .75rem; color: var(--muted); font-size: .9rem; }
+  th, td { text-align: left; padding: .45rem .75rem; border-top: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-size: .85rem; font-weight: 600; }
+  td.msg { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 12rem; }
+  td.id, td.num { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; }
+  td.id { overflow-wrap: anywhere; min-width: 9rem; }
+  td.time { white-space: nowrap; }
+  tr.empty td { color: var(--muted); text-align: center; padding: 1.5rem; }
+  @media (prefers-reduced-motion: no-preference) {
+    tr.fresh { animation: fresh 1.6s ease-out; }
+    @keyframes fresh { from { background: var(--new-row); } to { background: transparent; } }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Event Hubs passwordless PoC</h1>
+    <p class="sub">Send an event, watch it come back through the Kafka consumer, and check how this pod authenticates.</p>
+  </header>
+
+  <section aria-labelledby="status-h">
+    <h2 id="status-h">Status</h2>
+    <div id="status-banner" class="banner" role="status"></div>
+    <dl>
+      <div><dt>Live stream (SSE)</dt><dd id="st-sse"></dd></div>
+      <div><dt>Consumer</dt><dd id="st-consumer"></dd></div>
+      <div><dt>Authentication</dt><dd id="st-auth"></dd></div>
+      <div><dt>Workload identity</dt><dd id="st-wi"></dd></div>
+      <div><dt>Event Hubs bootstrap host</dt><dd id="st-host"></dd></div>
+      <div><dt>Resolved IP</dt><dd id="st-ip"></dd></div>
+      <div><dt>Passwordless auto-configuration</dt><dd id="st-auto"></dd></div>
+      <div><dt>Last consumer error</dt><dd id="st-error"></dd></div>
+    </dl>
+    <p class="hint">Refreshed every 5 seconds from <code>/api/diagnostics</code>. <span id="st-updated"></span></p>
+  </section>
+
+  <section aria-labelledby="send-h">
+    <h2 id="send-h">Send an event</h2>
+    <form id="send-form" autocomplete="off">
+      <div class="row">
+        <div class="grow">
+          <label for="message">Message</label>
+          <input id="message" name="message" type="text" maxlength="1000" required aria-describedby="send-hint">
+        </div>
+        <button id="send-btn" type="submit">Send</button>
+      </div>
+      <p id="send-hint" class="hint">Published to the event hub with source "dashboard" (up to 1000 characters).</p>
+      <p id="send-result" class="result" role="status" aria-live="polite"></p>
+    </form>
+  </section>
+
+  <section aria-labelledby="events-h">
+    <div class="toolbar">
+      <h2 id="events-h">Events</h2>
+      <div class="actions">
+        <span id="count" class="hint" style="margin:0"></span>
+        <button id="clear-btn" type="button" class="secondary" aria-describedby="clear-note">Clear view</button>
+      </div>
+    </div>
+    <p id="clear-note" class="hint" style="margin:0 0 .75rem">
+      "Clear view" only empties this view (the in-memory buffer in the app). Event Hubs keeps the events until its retention period expires; nothing is deleted from the hub.
+    </p>
+    <p id="clear-result" class="result" role="status" aria-live="polite" style="margin:0 0 .75rem"></p>
+    <div class="scroll" tabindex="0" role="region" aria-label="Events table, scrollable">
+      <table>
+        <caption>Newest first, at most 200 events</caption>
+        <thead>
+          <tr>
+            <th scope="col">Sent at</th>
+            <th scope="col">Id</th>
+            <th scope="col">Message</th>
+            <th scope="col">Source</th>
+            <th scope="col">Partition</th>
+            <th scope="col">Offset</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  var CAP = 200;
+  var $ = function (id) { return document.getElementById(id); };
+
+  // ---------------------------------------------------------------- helpers (DOM APIs only, never markup strings)
+
+  function setBadge(el, kind, text) {
+    el.textContent = '';
+    var b = document.createElement('span');
+    b.className = 'badge ' + kind;
+    b.textContent = text;
+    el.appendChild(b);
+    return b;
+  }
+
+  function addText(el, text) {
+    el.appendChild(document.createTextNode(text));
+  }
+
+  function fmtTime(iso) {
+    var d = new Date(iso);
+    if (!iso || isNaN(d.getTime())) { return String(iso == null ? '' : iso); }
+    return d.toLocaleString(undefined, { year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  }
+
+  function fetchJson(url, options, timeoutMs) {
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, timeoutMs || 8000);
+    options = options || {};
+    options.signal = ctl.signal;
+    options.cache = 'no-store';
+    return fetch(url, options).then(function (res) {
+      return res.text().then(function (text) {
+        var body = null;
+        try { body = text ? JSON.parse(text) : null; } catch (e) { body = null; }
+        return { ok: res.ok, status: res.status, body: body };
+      });
+    }).then(function (r) { clearTimeout(timer); return r; },
+            function (e) { clearTimeout(timer); throw e; });
+  }
+
+  // ---------------------------------------------------------------- events table
+
+  var rowsEl = $('rows');
+  var known = Object.create(null);   // id -> row element, to ignore an event seen twice (list + stream)
+
+  function updateCount() {
+    var n = Object.keys(known).length;
+    $('count').textContent = n + (n === 1 ? ' event' : ' events') + ' shown';
+    var empty = rowsEl.querySelector('tr.empty');
+    if (n === 0 && !empty) {
+      var tr = document.createElement('tr');
+      tr.className = 'empty';
+      var td = document.createElement('td');
+      td.colSpan = 6;
+      td.textContent = 'No events yet. Send one above.';
+      tr.appendChild(td);
+      rowsEl.appendChild(tr);
+    } else if (n > 0 && empty) {
+      rowsEl.removeChild(empty);
+    }
+  }
+
+  function cell(cls, text, title) {
+    var td = document.createElement('td');
+    if (cls) { td.className = cls; }
+    td.textContent = text == null ? '' : String(text);
+    if (title) { td.title = title; }
+    return td;
+  }
+
+  function buildRow(ev) {
+    var tr = document.createElement('tr');
+    tr.appendChild(cell('time', fmtTime(ev.sentAt), ev.sentAt));
+    tr.appendChild(cell('id', ev.id));
+    tr.appendChild(cell('msg', ev.message));
+    tr.appendChild(cell('', ev.source));
+    tr.appendChild(cell('num', ev.partition));
+    tr.appendChild(cell('num', ev.offset));
+    return tr;
+  }
+
+  function trim() {
+    var data = rowsEl.querySelectorAll('tr[data-id]');
+    for (var i = CAP; i < data.length; i++) {
+      delete known[data[i].getAttribute('data-id')];
+      rowsEl.removeChild(data[i]);
+    }
+  }
+
+  // Adds one event at the top. Ignores an id that is already shown.
+  function addEvent(ev, fresh) {
+    if (!ev || ev.id == null || known[ev.id]) { return; }
+    var tr = buildRow(ev);
+    tr.setAttribute('data-id', String(ev.id));
+    if (fresh) { tr.className = 'fresh'; }
+    known[ev.id] = tr;
+    var empty = rowsEl.querySelector('tr.empty');
+    if (empty) { rowsEl.removeChild(empty); }
+    rowsEl.insertBefore(tr, rowsEl.firstChild);
+    trim();
+    updateCount();
+  }
+
+  function clearRows() {
+    rowsEl.textContent = '';
+    known = Object.create(null);
+    updateCount();
+  }
+
+  // Replaces the table with the server's buffer (newest first).
+  function loadList() {
+    return fetchJson('/api/events').then(function (r) {
+      if (!r.ok || !r.body || !Array.isArray(r.body.events)) { throw new Error('HTTP ' + r.status); }
+      clearRows();
+      var events = r.body.events.slice(0, CAP);
+      for (var i = events.length - 1; i >= 0; i--) { addEvent(events[i], false); }
+      return true;
+    }).catch(function () {
+      setSse('bad', 'Could not load events', 'The event list could not be loaded from /api/events.');
+      return false;
+    });
+  }
+
+  // ---------------------------------------------------------------- live stream
+
+  var sseState = { kind: 'warn', text: 'Connecting', detail: '' };
+
+  function setSse(kind, text, detail) {
+    sseState = { kind: kind, text: text, detail: detail || '' };
+    renderSse();
+  }
+
+  function renderSse() {
+    var el = $('st-sse');
+    setBadge(el, sseState.kind, sseState.text);
+    if (sseState.detail) { addText(el, ' ' + sseState.detail); }
+  }
+
+  var source = null;
+  var everOpened = false;
+
+  function connect() {
+    if (!window.EventSource) {
+      setSse('bad', 'Not supported', 'This browser has no EventSource, so the table will not update live. Reload to refresh.');
+      return;
+    }
+    source = new EventSource('/api/events/stream');
+    source.onopen = function () {
+      setSse('ok', 'Live', '');
+      // Close any gap from before the (re)connection: the stream only carries events from now on.
+      loadList();
+      everOpened = true;
+    };
+    source.onerror = function () {
+      // EventSource reconnects by itself; say so instead of failing silently.
+      if (source.readyState === EventSource.CLOSED) {
+        setSse('bad', 'Disconnected', 'The server closed the stream. Reconnecting in 5 seconds.');
+        source = null;
+        setTimeout(connect, 5000);
+      } else {
+        setSse('warn', everOpened ? 'Reconnecting' : 'Connecting',
+          'The live stream is not connected; new events will not appear until it is.');
+      }
+    };
+    source.addEventListener('event', function (m) {
+      try { addEvent(JSON.parse(m.data), true); } catch (e) { /* ignore a malformed frame */ }
+    });
+    source.addEventListener('cleared', function () { clearRows(); });
+  }
+
+  // ---------------------------------------------------------------- send
+
+  var sendForm = $('send-form');
+  var sendBtn = $('send-btn');
+  var sendResult = $('send-result');
+
+  function showResult(el, kind, text) {
+    el.textContent = '';
+    if (!text) { el.className = 'result'; return; }
+    el.className = 'result ' + kind;
+    el.textContent = text;
+  }
+
+  sendForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var input = $('message');
+    var message = input.value;
+    if (!message.trim()) { showResult(sendResult, 'bad', 'Enter a message first.'); input.focus(); return; }
+    sendBtn.disabled = true;
+    showResult(sendResult, 'warn', 'Sending...');
+    fetchJson('/api/events', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: message, source: 'dashboard' })
+    }, 30000).then(function (r) {
+      var b = r.body || {};
+      if (r.ok && b.event) {
+        showResult(sendResult, 'ok', 'Sent. Event ' + b.event.id + ' accepted by topic "' + b.topic +
+          '", partition ' + b.partition + ', offset ' + b.offset + '. It appears in the table once the consumer reads it back.');
+        input.value = '';
+        input.focus();
+      } else if (r.status === 503) {
+        showResult(sendResult, 'bad', 'Send failed (' + (b.reason || 'unknown reason') + '): ' +
+          (b.message || 'the event hub did not accept the event') + '.');
+      } else {
+        showResult(sendResult, 'bad', 'Send failed (HTTP ' + r.status + '): ' +
+          (b.message || b.error || 'unexpected response') + '.');
+      }
+    }, function (err) {
+      showResult(sendResult, 'bad', 'Send failed: the app did not answer' +
+        (err && err.name === 'AbortError' ? ' in time.' : '.'));
+    }).then(function () { sendBtn.disabled = false; });
+  });
+
+  // ---------------------------------------------------------------- clear view
+
+  $('clear-btn').addEventListener('click', function () {
+    var btn = $('clear-btn');
+    var out = $('clear-result');
+    btn.disabled = true;
+    fetchJson('/api/events/clear', { method: 'POST' }).then(function (r) {
+      if (r.ok) {
+        clearRows();
+        showResult(out, 'ok', (r.body && r.body.message) ||
+          'Cleared the view only. Event Hubs still holds the events until retention expires.');
+      } else {
+        showResult(out, 'bad', 'Clear failed (HTTP ' + r.status + ').');
+      }
+    }, function () {
+      showResult(out, 'bad', 'Clear failed: the app did not answer.');
+    }).then(function () { btn.disabled = false; });
+  });
+
+  // ---------------------------------------------------------------- status panel
+
+  function yesNo(v) { return v === true ? 'yes' : (v === false ? 'no' : 'unknown'); }
+
+  function renderDiagnostics(d) {
+    var k = d.kafka || {};
+    var c = d.consumer || {};
+    var eh = d.eventHubs || {};
+    var wi = d.workloadIdentity || {};
+    var warnings = [];
+
+    // Consumer
+    var running = c.listenerRunning === true;
+    var parts = typeof c.assignedPartitions === 'number' ? c.assignedPartitions : 0;
+    var cEl = $('st-consumer');
+    if (running && parts > 0) {
+      setBadge(cEl, 'ok', 'Running');
+      addText(cEl, ' ' + parts + (parts === 1 ? ' partition' : ' partitions') + ' assigned (group "' + (c.groupId || '?') + '")');
+    } else if (running) {
+      setBadge(cEl, 'warn', 'Running, no partitions assigned yet');
+      warnings.push('The consumer has not been assigned any partitions yet; events sent now may not appear.');
+    } else {
+      setBadge(cEl, 'bad', 'Not running');
+      warnings.push('The consumer is not running, so events will not appear in the table. See "Last consumer error".');
+    }
+
+    // Authentication method
+    var aEl = $('st-auth');
+    var mech = k.saslMechanism || 'none';
+    setBadge(aEl, mech === 'OAUTHBEARER' ? 'ok' : 'bad', mech === 'none' ? 'No SASL mechanism' : mech);
+    addText(aEl, ' security protocol: ' + (k.securityProtocol || 'none'));
+    if (mech !== 'OAUTHBEARER') { warnings.push('SASL mechanism is not OAUTHBEARER.'); }
+
+    // Workload identity
+    var wEl = $('st-wi');
+    var missing = ['AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_FEDERATED_TOKEN_FILE'].filter(function (n) { return wi[n] !== true; });
+    if (missing.length === 0) {
+      setBadge(wEl, 'ok', 'Configured');
+      addText(wEl, ' client id, tenant id and federated token file are set');
+    } else {
+      setBadge(wEl, 'bad', 'Not configured');
+      addText(wEl, ' missing: ' + missing.join(', '));
+      warnings.push('Workload identity environment is incomplete (' + missing.join(', ') + ').');
+    }
+    addText(wEl, wi.AZURE_TOKEN_CREDENTIALS ? '; AZURE_TOKEN_CREDENTIALS=' + wi.AZURE_TOKEN_CREDENTIALS
+                                              : '; AZURE_TOKEN_CREDENTIALS not set');
+
+    // Bootstrap host and resolved IP
+    $('st-host').textContent = eh.bootstrapServer || eh.bootstrapHost || 'not configured';
+    var ipEl = $('st-ip');
+    if (eh.resolvedIp) {
+      ipEl.textContent = '';
+      addText(ipEl, eh.resolvedIp + ' ');
+      var pb = document.createElement('span');
+      pb.className = 'badge ' + (eh.resolvedIpIsPrivate === true ? 'ok' : 'bad');
+      pb.textContent = eh.resolvedIpIsPrivate === true ? 'private: yes' : 'private: no';
+      ipEl.appendChild(pb);
+      if (eh.resolvedIpIsPrivate !== true) { warnings.push('The Event Hubs host does not resolve to a private IP.'); }
+    } else {
+      setBadge(ipEl, 'bad', 'Not resolved');
+      if (eh.resolutionError) { addText(ipEl, ' ' + eh.resolutionError); }
+    }
+
+    // Passwordless auto-configuration
+    var pEl = $('st-auto');
+    var applied = k.passwordlessAutoConfigApplied === true;
+    setBadge(pEl, applied ? 'ok' : 'bad', applied ? 'Applied: yes' : 'Applied: no');
+    var problems = Array.isArray(k.problems) ? k.problems : [];
+    if (problems.length) {
+      var ul = document.createElement('ul');
+      ul.className = 'problems';
+      problems.forEach(function (p) {
+        var li = document.createElement('li');
+        li.textContent = String(p);
+        ul.appendChild(li);
+      });
+      pEl.appendChild(ul);
+    }
+    if (!applied) { warnings.push('Spring Cloud Azure passwordless auto-configuration is not applied.'); }
+
+    // Last consumer error
+    var eEl = $('st-error');
+    if (c.lastErrorClass) {
+      setBadge(eEl, 'warn', 'Error seen');
+      addText(eEl, ' ' + c.lastErrorClass + (c.lastErrorAt ? ' at ' + fmtTime(c.lastErrorAt) : ''));
+    } else {
+      setBadge(eEl, 'ok', 'None');
+    }
+
+    setBanner(warnings.length ? 'warn' : '', warnings.join(' '));
+  }
+
+  function setBanner(kind, text) {
+    var el = $('status-banner');
+    el.textContent = text || '';
+    el.className = 'banner' + (kind ? ' ' + kind : '');
+  }
+
+  function diagnosticsDown(reason) {
+    ['st-consumer', 'st-auth', 'st-wi', 'st-ip', 'st-auto', 'st-error'].forEach(function (id) {
+      setBadge($(id), 'bad', 'Unknown');
+    });
+    $('st-host').textContent = 'unknown';
+    setBanner('bad', 'The diagnostics endpoint is not answering (' + reason + '). The values below are unknown, not healthy.');
+  }
+
+  function pollDiagnostics() {
+    fetchJson('/api/diagnostics', null, 4000).then(function (r) {
+      if (!r.ok || !r.body) { throw new Error('HTTP ' + r.status); }
+      renderDiagnostics(r.body);
+      $('st-updated').textContent = 'Last updated ' + new Date().toLocaleTimeString() + '.';
+    }).catch(function (e) {
+      diagnosticsDown(e && e.name === 'AbortError' ? 'timed out' : (e && e.message) || 'error');
+      $('st-updated').textContent = 'Last attempt ' + new Date().toLocaleTimeString() + '.';
+    }).then(function () { setTimeout(pollDiagnostics, 5000); });
+  }
+
+  // ---------------------------------------------------------------- start
+
+  updateCount();
+  renderSse();
+  loadList();
+  connect();
+  pollDiagnostics();
+}());
+</script>
+</body>
+</html>
