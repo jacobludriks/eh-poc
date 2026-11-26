@@ -108,6 +108,8 @@ differences and have **not been exercised**. To move to the older line, in `app/
 **Verdict: it worked.** Spring Kafka authenticated to Azure Event Hubs with no password, connection string or SAS key,
 using an AKS workload identity, for both the producer and the consumer, over a private endpoint.
 
+![The dashboard running on the live AKS deployment: live stream connected, consumer running with 2 partitions, OAUTHBEARER over SASL_SSL, workload identity configured, resolved IP private](poc.png)
+
 Deployed to `australiaeast` (Visual Studio Professional subscription): AKS 1.36 on one `Standard_D2s_v5` node,
 Standard-tier Event Hubs (1 TU), Basic ACR. Versions used: Java 21, Spring Boot 4.1.2, Spring Cloud Azure 7.5.0,
 spring-kafka 4.1.2, kafka-clients 4.2.2, azure-identity 1.19.0. **The Boot 3.5.x fallback was not needed.**

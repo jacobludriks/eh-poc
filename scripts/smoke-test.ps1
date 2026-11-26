@@ -5,7 +5,7 @@
   evidence record. Exit code 0 only if every assertion passes; a non-zero exit names the failed assertion(s).
 
 .DESCRIPTION
-  Two seams only (see .scratch/eventhubs-passwordless-poc/spec.md, Testing Decisions):
+  Two seams only (the PoC spec's Testing Decisions):
     1. The deployed app's HTTP surface (readiness, /api/diagnostics, /api/events, the SSE stream, clear).
     2. Azure resource properties through the Azure CLI, and the `poc` namespace through kubectl.
 
