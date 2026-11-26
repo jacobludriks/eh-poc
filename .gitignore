@@ -11,3 +11,4 @@ kubeconfig*
 # Local agent working files (not published)
 .scratch/
 CLAUDE.md
+docs/agents/
