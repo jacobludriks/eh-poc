@@ -40,6 +40,21 @@ public sealed class FakeEventsApp : IDisposable
     public bool ClearIsNoop { get; set; }                // clear leaves the buffer untouched
     public bool ClearPurgesHub { get; set; }             // clear claims eventHubPurged=true
 
+    // Workload-identity simulation (negative test, ticket 06). The "pod" obtains its token when it starts, so the
+    // federated credential only matters at a restart (POST /__fake/restart, called by the fake kubectl): the app
+    // reads FederationFile (the canned `az identity federated-credential list` data) and, unless IgnoreFederation,
+    // is "auth broken" afterwards if no credential has the subject ValidSubject. While broken, POST /api/events
+    // answers 503 with BrokenReason and diagnostics show no assigned partitions plus BrokenLastErrorClass.
+    // FederationLagRestarts models Entra propagation delay: that many restarts still see the previous state.
+    public string FederationFile { get; set; }
+    public string ValidSubject { get; set; } = "system:serviceaccount:poc:ehpoc";
+    public bool IgnoreFederation { get; set; }           // credential changes never take effect (control case)
+    public int FederationLagRestarts { get; set; }
+    public string BrokenReason { get; set; } = "authentication";
+    public string BrokenLastErrorClass { get; set; } = "org.apache.kafka.common.KafkaException <- javax.security.auth.login.LoginException";
+    public bool AuthBroken { get { lock (gate) return authBroken; } }
+    bool authBroken;
+
     public List<string> RequestLog { get; } = new List<string>();
 
     public FakeEventsApp(int port)
@@ -75,6 +90,10 @@ public sealed class FakeEventsApp : IDisposable
             PostStatus = 201;
             PostOmitOffset = ListDropsEvent = SseDropsEvent = SseTampersMessage = ClearIsNoop = ClearPurgesHub = false;
             ListMutates = "";
+            FederationFile = null; ValidSubject = "system:serviceaccount:poc:ehpoc"; IgnoreFederation = false; FederationLagRestarts = 0;
+            BrokenReason = "authentication";
+            BrokenLastErrorClass = "org.apache.kafka.common.KafkaException <- javax.security.auth.login.LoginException";
+            authBroken = false;
             DiagnosticsJson = WarmupDiagnosticsJson = null;
             RequestLog.Clear();
         }
@@ -100,8 +119,18 @@ public sealed class FakeEventsApp : IDisposable
             else if (req.HttpMethod == "GET" && path == "/api/diagnostics")
             {
                 string body;
-                lock (gate) { body = diagnosticsCalls++ < DiagnosticsWarmupCalls ? WarmupDiagnosticsJson : DiagnosticsJson; }
+                lock (gate)
+                {
+                    body = diagnosticsCalls++ < DiagnosticsWarmupCalls ? WarmupDiagnosticsJson : DiagnosticsJson;
+                    if (authBroken) body = BrokenDiagnostics(body);
+                }
                 Json(res, 200, body);
+            }
+            else if (req.HttpMethod == "POST" && path == "/__fake/restart")
+            {
+                // Test-only control endpoint: the fake kubectl calls it for `rollout restart`.
+                lock (gate) { Restart(); }
+                Json(res, 200, "{\"restarted\":true}");
             }
             else if (req.HttpMethod == "POST" && path == "/api/events")
             {
@@ -171,7 +200,12 @@ public sealed class FakeEventsApp : IDisposable
         lock (gate)
         {
             postCalls++;
-            if (postCalls <= PostFailFirst)
+            if (authBroken)
+            {
+                failStatus = 503;
+                failBody = "{\"error\":\"publish_failed\",\"message\":\"canned\",\"reason\":\"" + BrokenReason + "\"}";
+            }
+            else if (postCalls <= PostFailFirst)
             {
                 failStatus = 503;
                 failBody = "{\"error\":\"publish_failed\",\"message\":\"canned\",\"reason\":\"authorization\"}";
@@ -218,6 +252,36 @@ public sealed class FakeEventsApp : IDisposable
         }
         if (failBody != null) Json(res, failStatus, failBody);
         else Json(res, 201, responseBody);
+    }
+
+    // Caller holds the lock. A pod restart: the in-memory view and the SSE connections are gone, and the new pod
+    // acquires its token against whatever federated credential Entra honours now (subject to the lag).
+    void Restart()
+    {
+        buffer.Clear();
+        foreach (var c in sseClients) { try { c.Close(); } catch { } }
+        sseClients.Clear();
+        bool shouldBeBroken = false;
+        if (!IgnoreFederation && FederationFile != null)
+        {
+            var creds = JsonNode.Parse(File.ReadAllText(FederationFile));
+            var list = creds is JsonArray a ? a : new JsonArray(creds.DeepClone());
+            shouldBeBroken = !list.Any(c => c?["subject"]?.GetValue<string>() == ValidSubject);
+        }
+        if (shouldBeBroken != authBroken)
+        {
+            if (FederationLagRestarts > 0) FederationLagRestarts--;
+            else authBroken = shouldBeBroken;
+        }
+    }
+
+    string BrokenDiagnostics(string body)
+    {
+        var d = JsonNode.Parse(body);
+        d["consumer"]["assignedPartitions"] = 0;
+        d["consumer"]["lastErrorClass"] = BrokenLastErrorClass;
+        d["consumer"]["lastErrorAt"] = DateTime.UtcNow.ToString("o");
+        return d.ToJsonString();
     }
 
     // Applies the ListMutates switch to a copy of a buffered event.

@@ -44,7 +44,32 @@ param(
     [ValidateRange(1, 600)]
     [int] $PollTimeoutSeconds = 30,
     [ValidateRange(1, 60)]
-    [int] $PollIntervalSeconds = 3
+    [int] $PollIntervalSeconds = 3,
+
+    # ---- Opt-in negative test (ticket 06). A normal run never changes infrastructure; only these switches do.
+    # NEGATIVE TEST: TEMPORARILY BREAKS THE FEDERATED CREDENTIAL of the DEPLOYED PoC (changes its subject so the pod
+    # can no longer exchange its service-account token), restarts the pod, expects the Event Hubs round trip to FAIL
+    # with an authentication failure, then restores the exact original credential, restarts the pod again and
+    # expects the round trip to pass. While it runs the app cannot reach Event Hubs. It asks for confirmation
+    # unless -Force is given. The credential is restored even if an assertion fails, an error occurs or Ctrl-C is
+    # pressed; the original is saved first under .deploy-state/ (next to the state file).
+    [switch] $NegativeTest,
+    # RECOVERY: restores the federated credential from the file saved by an earlier -NegativeTest run that died
+    # midway (killed shell, lost connection), restarts the pod and checks the round trip. Does nothing if there is
+    # no saved file.
+    [switch] $RestoreFederatedCredential,
+    # Skip the confirmation prompt of -NegativeTest (needed when there is no interactive console).
+    [switch] $Force,
+    # -NegativeTest / -RestoreFederatedCredential: how long to allow Entra to honour a federated-credential change.
+    # Each attempt restarts the pod (a token is only exchanged at startup) and checks the outcome.
+    [ValidateRange(1, 7200)]
+    [int] $PropagationTimeoutSeconds = 600,
+    # -NegativeTest / -RestoreFederatedCredential: budget for each `kubectl rollout status` after a restart.
+    [ValidateRange(1, 1800)]
+    [int] $RolloutTimeoutSeconds = 300,
+    # Where -NegativeTest saves the original credential (default: federated-credential-original.json next to
+    # the state file).
+    [string] $FederatedCredentialBackupFile
 )
 
 Set-StrictMode -Version Latest
@@ -59,11 +84,15 @@ $ExpectedRoles = @('Azure Event Hubs Data Receiver', 'Azure Event Hubs Data Send
 $script:Results = [System.Collections.Generic.List[object]]::new()
 $script:BaseUrl = $null
 $script:State = $null
+# Prepended to every assertion id. Empty in the standard run; the negative mode sets it while it reuses the
+# standard HTTP building blocks for its baseline and recovery round trips, so those ids stay distinct.
+$script:IdPrefix = ''
 
 # ================================================================== assertions
 function Assert-That {
     # Records and prints one assertion. -Ok false = FAIL. Detail is a short factual note, never a secret.
     param([string] $Id, [string] $Label, [bool] $Ok, [string] $Detail = '')
+    $Id = "$script:IdPrefix$Id"
     $script:Results.Add([pscustomobject]@{ Id = $Id; Label = $Label; Ok = $Ok; Detail = $Detail })
     $text = if ($Detail) { "$Label ($Detail)" } else { $Label }
     if ($Ok) { Write-Host "PASS [$Id] $text" -ForegroundColor Green }
@@ -167,9 +196,9 @@ function Close-Sse {
     try { $Connection.Client.Dispose() } catch { Write-Verbose 'SSE dispose failed' }
 }
 
-function Invoke-ExternalJson {
-    # Runs a native command, returns its stdout parsed as JSON. Stderr is kept out of stdout and only surfaced
-    # (first line) when the command fails. Never echoes stdout, which for kubectl could hold secret data.
+function Invoke-ExternalText {
+    # Runs a native command, returns its trimmed stdout (never echoed: for kubectl it could hold secret data).
+    # Stderr is kept out of stdout and only surfaced (first line) when the command fails.
     param([string] $Tool, [string[]] $Arguments)
     $output = & $Tool @Arguments 2>&1
     $code = $LASTEXITCODE
@@ -179,7 +208,12 @@ function Invoke-ExternalJson {
         $why = if ($err.Count) { $err[0] } else { 'no error output' }
         throw "$Tool exited with code ${code}: $why"
     }
-    $text = ($out -join "`n").Trim()
+    return ($out -join "`n").Trim()
+}
+
+function Invoke-ExternalJson {
+    param([string] $Tool, [string[]] $Arguments)
+    $text = Invoke-ExternalText -Tool $Tool -Arguments $Arguments
     if (-not $text) { return $null }
     return ($text | ConvertFrom-Json)
 }
@@ -190,6 +224,12 @@ function Invoke-Kubectl {
     # kubectl against the kubeconfig deploy.ps1 saved, never against ~/.kube.
     param([string[]] $Arguments)
     Invoke-ExternalJson -Tool 'kubectl' -Arguments (@('--kubeconfig', $script:State.kubeconfig) + $Arguments)
+}
+
+function Invoke-KubectlText {
+    # For kubectl commands whose output is not JSON (rollout restart / status). Same kubeconfig rule.
+    param([string[]] $Arguments)
+    Invoke-ExternalText -Tool 'kubectl' -Arguments (@('--kubeconfig', $script:State.kubeconfig) + $Arguments)
 }
 
 # ================================================================== state and endpoint
@@ -219,11 +259,16 @@ function Resolve-AppUrl {
 }
 
 # ================================================================== HTTP building blocks
-function Wait-ForApp {
-    $r = Wait-Until -TimeoutSeconds $ReadyTimeoutSeconds -IntervalMilliseconds ($PollIntervalSeconds * 1000) -Condition {
+function Wait-ForReadiness {
+    # Quiet: no assertion recorded. Readiness does not depend on Kafka, so it also works while auth is broken.
+    Wait-Until -TimeoutSeconds $ReadyTimeoutSeconds -IntervalMilliseconds ($PollIntervalSeconds * 1000) -Condition {
         $x = Invoke-Api -Method GET -Path '/actuator/health/readiness' -TimeoutSec 10
         if ($x.Status -eq 200 -and (Get-Prop $x.Json 'status') -eq 'UP') { $x }
     }
+}
+
+function Wait-ForApp {
+    $r = Wait-ForReadiness
     Assert-That -Id 'app-ready' -Label "GET $script:BaseUrl/actuator/health/readiness is UP" -Ok ($null -ne $r) `
         -Detail $(if ($r) { 'status UP' } else { "not UP within ${ReadyTimeoutSeconds}s" })
     return ($null -ne $r)
@@ -453,6 +498,310 @@ function Test-Infrastructure {
     }
 }
 
+# ================================================================== negative test (opt-in, changes infrastructure)
+# Proves the success is caused by workload identity: break the federated credential, expect an authentication
+# failure, restore, expect success. A normal run never reaches any of this.
+#   1. baseline round trip (ids negative-baseline-*, rolled up as negative-baseline)
+#   2. save the original credential to a state file, THEN change its subject (negative-credential-broken)
+#   3. restart the pod (tokens are only exchanged at startup: an issued token and Kafka's cached login stay valid
+#      until expiry, so changing the credential alone proves nothing), retried within -PropagationTimeoutSeconds
+#      until the send fails; assert the failure and that it is an authentication failure
+#      (negative-auth-fails, negative-attributed-to-auth)
+#   4. finally: restore the exact original credential (negative-credential-restored) and restart the pod
+#   5. recovery round trip (ids negative-restored-*, rolled up as negative-restored)
+# The standard assertions (e.g. federated-subject) are NOT run here: they would fail while the credential is broken.
+$BrokenSubjectSuffix = '-negative-test'
+$AuthFailurePattern = 'Authentication|LoginException|CredentialUnavailable'   # not "Authorization": that is roles
+
+function Get-K8sNamespace { if (Get-Prop $script:State 'namespace') { $script:State.namespace } else { 'poc' } }
+function Get-FailedCount { @($script:Results | Where-Object { -not $_.Ok }).Count }
+function Get-RetryDelaySeconds { [Math]::Max(1, $PollIntervalSeconds * 5) }
+
+function Get-BackupPath {
+    if ($FederatedCredentialBackupFile) { return $FederatedCredentialBackupFile }
+    Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($StateFile))) 'federated-credential-original.json'
+}
+
+function Get-FederatedCredentials {
+    @(Invoke-Az -Arguments @('identity', 'federated-credential', 'list', '--identity-name', $script:State.identityName, '--resource-group', $script:State.resourceGroup))
+}
+
+function Update-FederatedCredential {
+    # Changes only what is passed (the break passes only the subject; the restore passes subject, issuer, audiences).
+    param([string] $Name, [string] $Subject, [string] $Issuer, [string[]] $Audiences)
+    $arguments = @('identity', 'federated-credential', 'update', '--identity-name', $script:State.identityName,
+        '--resource-group', $script:State.resourceGroup, '--name', $Name, '--subject', $Subject)
+    if ($Issuer) { $arguments += @('--issuer', $Issuer) }
+    if ($Audiences) { $arguments += @('--audiences') + $Audiences }
+    $null = Invoke-Az -Arguments $arguments    # output (the credential, no secrets) is not printed
+}
+
+function Test-CredentialEquals {
+    param($Actual, $Expected)
+    $Actual -and (Get-Prop $Actual 'subject') -eq $Expected.subject -and (Get-Prop $Actual 'issuer') -eq $Expected.issuer `
+        -and ((@(Get-Prop $Actual 'audiences') | Sort-Object) -join '|') -eq ((@($Expected.audiences) | Sort-Object) -join '|')
+}
+
+function Restart-App {
+    # A token is only exchanged when the pod starts, so a fresh pod is what makes a credential change observable.
+    $ns = Get-K8sNamespace
+    Write-Host '  restarting deployment/ehpoc (fresh workload-identity token exchange)...'
+    $null = Invoke-KubectlText -Arguments @('rollout', 'restart', 'deployment/ehpoc', '-n', $ns)
+    $null = Invoke-KubectlText -Arguments @('rollout', 'status', 'deployment/ehpoc', '-n', $ns, "--timeout=${RolloutTimeoutSeconds}s")
+}
+
+function Confirm-NegativeTest {
+    param($Credential)
+    Write-Host ''
+    Write-Host '*** NEGATIVE TEST: this TEMPORARILY BREAKS the federated credential of the deployed PoC. ***' -ForegroundColor Yellow
+    Write-Host "    Identity $($script:State.identityName) in $($script:State.resourceGroup): credential '$($Credential.name)' gets a subject that cannot match," -ForegroundColor Yellow
+    Write-Host '    the pod is restarted, and until the credential is restored the app cannot authenticate to Event Hubs.' -ForegroundColor Yellow
+    Write-Host "    The original is saved to $(Get-BackupPath) first and restored afterwards (also on failure or Ctrl-C);" -ForegroundColor Yellow
+    Write-Host '    if the run is killed, use -RestoreFederatedCredential.' -ForegroundColor Yellow
+    if ($Force) { return }
+    try { $answer = Read-Host "Type 'break' to continue" }
+    catch { throw 'Confirmation required but there is no interactive prompt. Re-run with -Force to confirm. Nothing was changed.' }
+    if ($answer -ne 'break') { throw 'Not confirmed. Nothing was changed.' }
+}
+
+function Test-HealthyRoundTrip {
+    # The standard HTTP building blocks with a phase prefix on every id. True if none of them failed.
+    param([string] $Prefix)
+    $before = Get-FailedCount
+    $script:IdPrefix = $Prefix
+    try {
+        $script:LastDiag = $null
+        if (Wait-ForApp) {
+            if (Wait-ForConsumer) { Test-RoundTrip }
+            else { Assert-NotEvaluated -Id 'send-accepted', 'list-roundtrip', 'sse-delivery' -Because 'the consumer is not ready (events sent now would not be delivered)' }
+        }
+        else { Assert-NotEvaluated -Id 'consumer-ready', 'send-accepted', 'list-roundtrip', 'sse-delivery' -Because 'the app is not ready' }
+    }
+    finally { $script:IdPrefix = '' }
+    return ((Get-FailedCount) -eq $before)
+}
+
+function Wait-ForBrokenAuth {
+    # Restart the pod and send, until the send fails or -PropagationTimeoutSeconds is spent. A send that is still
+    # accepted means the pod still obtained a token: the change has not propagated in Entra yet, so retry.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $deadline = [DateTime]::UtcNow.AddSeconds($PropagationTimeoutSeconds)
+    $attempt = 0
+    $lastSend = $null
+    while ($true) {
+        $attempt++
+        Restart-App
+        if (Wait-ForReadiness) {
+            $message = "smoke-test-negative-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+            $send = Invoke-Api -Method POST -Path '/api/events' -Body @{ message = $message; source = 'api' } -TimeoutSec 60
+            $lastSend = $send
+            if ($send.Status -ne 201) {
+                # Diagnostics for attribution: the consumer's last error class appears shortly after the pod starts.
+                $diag = Wait-Until -TimeoutSeconds $PollTimeoutSeconds -IntervalMilliseconds 1000 -Condition {
+                    $d = Get-Diagnostics
+                    if ($d -and (Get-Prop $d 'consumer.lastErrorClass')) { $d }
+                }
+                if (-not $diag) { $diag = Get-Diagnostics }
+                return [pscustomobject]@{ Failed = $true; Send = $send; Diag = $diag; Attempts = $attempt; Seconds = [int]$clock.Elapsed.TotalSeconds }
+            }
+            Write-Host "  attempt ${attempt}: the pod still got a token and the send was accepted; the change may not have propagated yet" -ForegroundColor Yellow
+        }
+        else { Write-Host "  attempt ${attempt}: the app was not ready after the restart" -ForegroundColor Yellow }
+        if ([DateTime]::UtcNow.AddSeconds((Get-RetryDelaySeconds)) -ge $deadline) {
+            return [pscustomobject]@{ Failed = $false; Send = $lastSend; Diag = $null; Attempts = $attempt; Seconds = [int]$clock.Elapsed.TotalSeconds }
+        }
+        Start-Sleep -Seconds (Get-RetryDelaySeconds)
+    }
+}
+
+function Test-BrokenAuthOutcome {
+    param($Observed)
+    if (-not $Observed.Failed) {
+        $sent = if ($Observed.Send) { "HTTP $($Observed.Send.Status)" } else { 'app never ready' }
+        Assert-That -Id 'negative-auth-fails' -Label 'with the federated credential broken, sending an event fails' -Ok $false `
+            -Detail "still working after $($Observed.Attempts) restart(s) in $($Observed.Seconds)s ($sent): the broken credential had no effect or has not propagated; raise -PropagationTimeoutSeconds"
+        Assert-NotEvaluated -Id 'negative-attributed-to-auth' -Because 'no failure was observed'
+        return
+    }
+    $send = $Observed.Send
+    $reason = Get-Prop $send.Json 'reason'
+    $partitions = Get-Prop $Observed.Diag 'consumer.assignedPartitions'
+    $errorClass = Get-Prop $Observed.Diag 'consumer.lastErrorClass'
+    $sendText = "HTTP $($send.Status)$(if ($reason) { " reason=$reason" })"
+    if ($null -eq $Observed.Diag) {
+        Assert-That -Id 'negative-auth-fails' -Label 'with the federated credential broken, sending an event fails' -Ok $false -Detail "$sendText but /api/diagnostics unavailable, so the consumer could not be checked"
+    }
+    else {
+        Assert-That -Id 'negative-auth-fails' -Label 'with the federated credential broken, sending an event fails and the consumer has no partitions' `
+            -Ok ($send.Status -ne 201 -and [int]$partitions -eq 0) `
+            -Detail "$sendText; consumer assignedPartitions=$partitions; after $($Observed.Attempts) restart(s), $($Observed.Seconds)s after the change"
+    }
+    $viaSend = $reason -eq 'authentication'
+    $viaConsumer = [bool]($errorClass -and ([string]$errorClass -match $AuthFailurePattern))
+    Assert-That -Id 'negative-attributed-to-auth' -Label 'the failure is an authentication failure (not authorization, timeout or unavailability)' -Ok ($viaSend -or $viaConsumer) `
+        -Detail "send reason=$(if ($reason) { $reason } else { 'none' }); consumer lastErrorClass=$(if ($errorClass) { $errorClass } else { 'none' })"
+}
+
+function Restore-FederatedCredential {
+    # Puts back the exact saved credential and verifies it by reading it back. Keeps the backup file unless verified.
+    # Returns $true if the credential is verified restored. Never throws (it runs from finally).
+    param($Backup)
+    $problem = 'unknown'
+    for ($try = 1; $try -le 3; $try++) {
+        try {
+            Update-FederatedCredential -Name $Backup.name -Subject $Backup.subject -Issuer $Backup.issuer -Audiences @($Backup.audiences)
+            $now = Get-FederatedCredentials | Where-Object { (Get-Prop $_ 'name') -eq $Backup.name } | Select-Object -First 1
+            if (Test-CredentialEquals $now $Backup) {
+                Remove-Item -LiteralPath (Get-BackupPath) -Force -ErrorAction SilentlyContinue
+                Assert-That -Id 'negative-credential-restored' -Label "federated credential '$($Backup.name)' restored to the original subject, issuer and audiences" -Ok $true -Detail "subject=$($Backup.subject)"
+                return $true
+            }
+            $problem = 'read back a credential that differs from the original'
+        }
+        catch { $problem = $_.Exception.Message }
+        Write-Host "  restore attempt $try of 3 failed: $problem" -ForegroundColor Yellow
+        if ($try -lt 3) { Start-Sleep -Seconds $PollIntervalSeconds }
+    }
+    Assert-That -Id 'negative-credential-restored' -Label "federated credential '$($Backup.name)' restored to the original" -Ok $false -Detail "NOT RESTORED: $problem"
+    Write-Host "!!! THE FEDERATED CREDENTIAL IS STILL BROKEN. The original is saved in $(Get-BackupPath). Run: scripts/smoke-test.ps1 -RestoreFederatedCredential" -ForegroundColor Red
+    return $false
+}
+
+function Test-Recovered {
+    # After the credential is restored: restart (unless just done), allow Entra to honour the restore, then the
+    # normal round trip must pass again (ids negative-restored-*, rolled up as negative-restored).
+    param([bool] $AlreadyRestarted)
+    Write-Host "`n-- Recovery: round trip must pass again" -ForegroundColor Cyan
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $deadline = [DateTime]::UtcNow.AddSeconds($PropagationTimeoutSeconds)
+    $window = [Math]::Min($ReadyTimeoutSeconds, 120)
+    $restart = -not $AlreadyRestarted
+    $attempt = 0
+    $recovered = $false
+    while ($true) {
+        $attempt++
+        if ($restart) { Restart-App }
+        $restart = $true
+        if (Wait-ForReadiness) {
+            $d = Wait-Until -TimeoutSeconds $window -IntervalMilliseconds ($PollIntervalSeconds * 1000) -Condition {
+                $x = Get-Diagnostics
+                if ($x -and (Get-Prop $x 'consumer.listenerRunning') -eq $true -and [int](Get-Prop $x 'consumer.assignedPartitions') -gt 0) { $x }
+            }
+            if ($d) { $recovered = $true; break }
+        }
+        Write-Host "  attempt ${attempt}: the consumer has no partitions yet; the restore may not have propagated" -ForegroundColor Yellow
+        if ([DateTime]::UtcNow.AddSeconds((Get-RetryDelaySeconds)) -ge $deadline) { break }
+        Start-Sleep -Seconds (Get-RetryDelaySeconds)
+    }
+    if (-not $recovered) {
+        $script:IdPrefix = 'negative-restored-'
+        try { Assert-NotEvaluated -Id 'app-ready', 'consumer-ready', 'send-accepted', 'list-roundtrip', 'sse-delivery' -Because 'the consumer never recovered' }
+        finally { $script:IdPrefix = '' }
+        Assert-That -Id 'negative-restored' -Label 'after restoring the credential the round trip passes again' -Ok $false `
+            -Detail "consumer had no partitions after $attempt restart(s) in $([int]$clock.Elapsed.TotalSeconds)s; raise -PropagationTimeoutSeconds"
+        return
+    }
+    $ok = Test-HealthyRoundTrip -Prefix 'negative-restored-'
+    Assert-That -Id 'negative-restored' -Label 'after restoring the credential the round trip passes again' -Ok $ok `
+        -Detail "recovered after $attempt attempt(s), $([int]$clock.Elapsed.TotalSeconds)s"
+}
+
+function Invoke-NegativeTest {
+    Initialize-Run
+    $backupPath = Get-BackupPath
+    if (Test-Path -LiteralPath $backupPath) {
+        throw "A saved credential already exists at ${backupPath}: a previous -NegativeTest run may have died with the credential broken. Run -RestoreFederatedCredential first. Nothing was changed."
+    }
+    $credentials = @(Get-FederatedCredentials)
+    if ($credentials.Count -ne 1) { throw "Expected exactly one federated credential on $($script:State.identityName), found $($credentials.Count). Not breaking anything." }
+    $original = $credentials[0]
+    if ((Get-Prop $original 'subject') -ne $ExpectedFederatedSubject) {
+        throw "The federated credential subject is '$(Get-Prop $original 'subject')', not the expected ${ExpectedFederatedSubject}: it may already be broken (see -RestoreFederatedCredential). Not breaking anything."
+    }
+    Confirm-NegativeTest -Credential $original
+
+    Write-Host "`n-- Baseline: the healthy round trip must work before anything is changed" -ForegroundColor Cyan
+    $baselineOk = Test-HealthyRoundTrip -Prefix 'negative-baseline-'
+    Assert-That -Id 'negative-baseline' -Label 'healthy round trip works before the federated credential is touched' -Ok $baselineOk
+    if (-not $baselineOk) {
+        Assert-NotEvaluated -Id 'negative-credential-broken', 'negative-auth-fails', 'negative-attributed-to-auth', 'negative-credential-restored', 'negative-restored' `
+            -Because 'the baseline failed, so nothing was changed'
+        Show-Summary
+        return
+    }
+
+    # Saved BEFORE the first change, so the original can always be put back.
+    $backup = [pscustomobject]@{
+        identityName = $script:State.identityName; resourceGroup = $script:State.resourceGroup; name = $original.name
+        issuer = $original.issuer; subject = $original.subject; audiences = @($original.audiences)
+        savedAt = [DateTime]::UtcNow.ToString('o')
+    }
+    New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($backupPath))) | Out-Null
+    $backup | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $backupPath
+    Write-Host "`n-- Breaking the federated credential (original saved to $backupPath)" -ForegroundColor Cyan
+
+    $restored = $false
+    $restarted = $false
+    try {
+        Update-FederatedCredential -Name $backup.name -Subject "$($backup.subject)$BrokenSubjectSuffix"
+        $now = Get-FederatedCredentials | Where-Object { (Get-Prop $_ 'name') -eq $backup.name } | Select-Object -First 1
+        $isBroken = (Get-Prop $now 'subject') -eq "$($backup.subject)$BrokenSubjectSuffix"
+        Assert-That -Id 'negative-credential-broken' -Label 'federated credential subject changed to one that cannot match the pod' -Ok $isBroken `
+            -Detail "subject=$(Get-Prop $now 'subject')"
+        if ($isBroken) {
+            Write-Host "`n-- Expecting authentication to fail (allowing up to ${PropagationTimeoutSeconds}s for Entra to honour the change)" -ForegroundColor Cyan
+            Test-BrokenAuthOutcome -Observed (Wait-ForBrokenAuth)
+        }
+        else { Assert-NotEvaluated -Id 'negative-auth-fails', 'negative-attributed-to-auth' -Because 'the credential was not changed' }
+    }
+    catch {
+        Assert-That -Id 'negative-run-error' -Label 'negative test aborted by an error' -Ok $false -Detail $_.Exception.Message
+        $unreported = @('negative-credential-broken', 'negative-auth-fails', 'negative-attributed-to-auth' | Where-Object { $_ -notin $script:Results.Id })
+        if ($unreported) { Assert-NotEvaluated -Id $unreported -Because 'the run was aborted by an error' }
+    }
+    finally {
+        Write-Host "`n-- Restoring the federated credential" -ForegroundColor Cyan
+        $restored = Restore-FederatedCredential -Backup $backup
+        if ($restored) {
+            try { Restart-App; $restarted = $true }
+            catch { Write-Host "  could not restart the pod: $($_.Exception.Message)" -ForegroundColor Yellow }
+        }
+    }
+
+    if (-not $restored) { Assert-NotEvaluated -Id 'negative-restored' -Because 'the credential could not be restored (see above)' }
+    else {
+        try { Test-Recovered -AlreadyRestarted $restarted }
+        catch { Assert-That -Id 'negative-restored' -Label 'after restoring the credential the round trip passes again' -Ok $false -Detail $_.Exception.Message }
+    }
+    Show-Summary
+}
+
+function Invoke-RestoreOnly {
+    Initialize-Run
+    $backupPath = Get-BackupPath
+    if (-not (Test-Path -LiteralPath $backupPath)) {
+        Write-Host "No saved credential at ${backupPath}: nothing to restore, nothing changed."
+        return
+    }
+    $backup = Get-Content -Raw -LiteralPath $backupPath | ConvertFrom-Json
+    foreach ($key in 'name', 'issuer', 'subject', 'audiences', 'identityName', 'resourceGroup') {
+        if (-not (Get-Prop $backup $key)) { throw "Saved credential $backupPath has no '$key'. Restore the credential manually." }
+    }
+    if ($backup.identityName -ne $script:State.identityName -or $backup.resourceGroup -ne $script:State.resourceGroup) {
+        throw "Saved credential $backupPath belongs to identity $($backup.identityName) in $($backup.resourceGroup), not the deployed $($script:State.identityName) in $($script:State.resourceGroup). Not touching anything."
+    }
+    Write-Host "`n-- Restoring the federated credential from $backupPath" -ForegroundColor Cyan
+    if (Restore-FederatedCredential -Backup $backup) {
+        $restarted = $false
+        try { Restart-App; $restarted = $true }
+        catch { Write-Host "  could not restart the pod: $($_.Exception.Message)" -ForegroundColor Yellow }
+        try { Test-Recovered -AlreadyRestarted $restarted }
+        catch { Assert-That -Id 'negative-restored' -Label 'after restoring the credential the round trip passes again' -Ok $false -Detail $_.Exception.Message }
+    }
+    else { Assert-NotEvaluated -Id 'negative-restored' -Because 'the credential could not be restored (see above)' }
+    Show-Summary
+}
+
 # ================================================================== run
 function Show-Summary {
     $failed = @($script:Results | Where-Object { -not $_.Ok })
@@ -464,13 +813,17 @@ function Show-Summary {
     else { Write-Host "Summary: $passed passed, 0 failed ($($script:Results.Count) assertions)." -ForegroundColor Green }
 }
 
-function Invoke-SmokeTest {
+function Initialize-Run {
     foreach ($tool in 'az', 'kubectl') {
         if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool not found on PATH (needed for the infrastructure assertions)." }
     }
     $script:State = Read-DeployState
     $script:BaseUrl = Resolve-AppUrl
     Write-Host "Smoke test: app $script:BaseUrl, resource group $($script:State.resourceGroup), namespace $($script:State.eventHubsNamespace)" -ForegroundColor Cyan
+}
+
+function Invoke-SmokeTest {
+    Initialize-Run
 
     Write-Host "`n-- App (HTTP)" -ForegroundColor Cyan
     $script:LastDiag = $null
@@ -492,7 +845,12 @@ function Invoke-SmokeTest {
     Show-Summary
 }
 
-try { Invoke-SmokeTest }
+try {
+    if ($NegativeTest -and $RestoreFederatedCredential) { throw '-NegativeTest and -RestoreFederatedCredential cannot be combined.' }
+    if ($NegativeTest) { Invoke-NegativeTest }
+    elseif ($RestoreFederatedCredential) { Invoke-RestoreOnly }
+    else { Invoke-SmokeTest }
+}
 catch {
     # Setup problem (no state, tools missing): nothing was proven.
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red

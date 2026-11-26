@@ -43,6 +43,14 @@ $allIds = @(
 )
 $httpIds = $allIds[0..12]
 
+# Negative mode (-NegativeTest, ticket 06): every assertion id it reports on a fully successful run. The baseline and
+# restored round trips reuse the standard HTTP building blocks, so their ids carry a phase prefix.
+$roundTripIds = 'app-ready', 'consumer-ready', 'send-accepted', 'list-roundtrip', 'sse-delivery'
+$negIds = @('negative-baseline') + @($roundTripIds | ForEach-Object { "negative-baseline-$_" }) + @(
+    'negative-credential-broken', 'negative-auth-fails', 'negative-attributed-to-auth', 'negative-credential-restored', 'negative-restored'
+) + @($roundTripIds | ForEach-Object { "negative-restored-$_" })
+$originalSubject = 'system:serviceaccount:poc:ehpoc'
+
 # ------------------------------------------------------------------ environment: fake app, shims
 Add-Type -Path (Join-Path $here 'FakeEventsApp.cs')
 $port = & {
@@ -89,6 +97,9 @@ function Invoke-Scenario($Scenario) {
         Server    = @{}                 # FakeEventsApp property overrides
         ScriptArgs = @{}                 # extra smoke-test.ps1 parameters
         RemoveFiles = @()                # canned files to delete (simulates a failing az call)
+        ExtraFiles = @{}                 # extra files to create in the scenario directory (name -> content)
+        AzUpdateFailCalls = ''           # fake az: comma list of federated-credential update calls that fail
+        KubectlFailRestart = $false      # fake kubectl: rollout restart fails
         ServiceIp = '127.0.0.1'
     }
     $d.State.kubeconfig = $kubeconfig
@@ -102,9 +113,13 @@ function Invoke-Scenario($Scenario) {
     Set-Content -Path (Join-Path $dir 'service.json') -Value (ConvertTo-FixtureJson ([pscustomobject]@{ status = [pscustomobject]@{ loadBalancer = [pscustomobject]@{ ingress = @([pscustomobject]@{ ip = $d.ServiceIp }) } } }))
     Set-Content -Path (Join-Path $dir 'deploy-outputs.json') -Value (ConvertTo-FixtureJson $d.State)
     foreach ($f in $d.RemoveFiles) { Remove-Item -Path (Join-Path $dir $f) }
+    foreach ($f in $d.ExtraFiles.Keys) { Set-Content -Path (Join-Path $dir $f) -Value $d.ExtraFiles[$f] }
+    if ($d.AzUpdateFailCalls) { Set-Content -Path (Join-Path $dir 'update-fail-calls.txt') -Value $d.AzUpdateFailCalls }
+    if ($d.KubectlFailRestart) { Set-Content -Path (Join-Path $dir 'fail-rollout-restart') -Value 'x' }
 
     $server.Reset()
     $server.DiagnosticsJson = ConvertTo-FixtureJson $d.Diag
+    $server.FederationFile = Join-Path $dir 'federated-credentials.json'
     foreach ($k in $d.Server.Keys) { $server.$k = $d.Server[$k] }
 
     $argList = [ordered]@{
@@ -115,15 +130,20 @@ function Invoke-Scenario($Scenario) {
     }
     if (-not $Scenario.UseServiceEndpoint) { $argList.Endpoint = $server.BaseUrl }
     foreach ($k in $d.ScriptArgs.Keys) { $argList[$k] = $d.ScriptArgs[$k] }
-    $childArgs = @('-NoProfile', '-File', $smokeScript)
-    foreach ($k in $argList.Keys) { $childArgs += "-$k"; $childArgs += [string]$argList[$k] }
+    # -NonInteractive: a prompt in the script under test fails instead of waiting on this console.
+    $childArgs = @('-NoProfile', '-NonInteractive', '-File', $smokeScript)
+    foreach ($k in $argList.Keys) {
+        if ($argList[$k] -is [bool]) { if ($argList[$k]) { $childArgs += "-$k" } }   # a switch
+        else { $childArgs += "-$k"; $childArgs += [string]$argList[$k] }
+    }
 
     # The shims are on PATH for this child process only (restored right after).
     $oldPath = $env:PATH
     $env:PATH = $shimDir + [IO.Path]::PathSeparator + $env:PATH
     $env:SMOKE_FAKE_DIR = $dir
+    $env:SMOKE_FAKE_APP_URL = $server.BaseUrl
     try { $output = & $pwsh @childArgs 2>&1 | ForEach-Object { "$_" }; $exit = $LASTEXITCODE }
-    finally { $env:PATH = $oldPath; Remove-Item Env:\SMOKE_FAKE_DIR -ErrorAction SilentlyContinue }
+    finally { $env:PATH = $oldPath; Remove-Item Env:\SMOKE_FAKE_DIR, Env:\SMOKE_FAKE_APP_URL -ErrorAction SilentlyContinue }
 
     $text = $output -join "`n"
     $passed = @([regex]::Matches($text, '(?m)^PASS \[([a-z0-9-]+)\]') | ForEach-Object { $_.Groups[1].Value })
@@ -132,11 +152,17 @@ function Invoke-Scenario($Scenario) {
 
     $problems = @()
     $expected = @($Scenario.ExpectFail)
-    if ($expected.Count -eq 0) {
+    $ids = if ($Scenario.Ids) { @($Scenario.Ids) } else { $allIds }
+    if ($null -ne $Scenario.ExpectExit) {
+        # A setup problem (exit 2): nothing is asserted, so no PASS/FAIL line may appear.
+        if ($exit -ne $Scenario.ExpectExit) { $problems += "expected exit $($Scenario.ExpectExit), got $exit" }
+        if ($passed -or $failed) { $problems += "no assertion should have run, saw: $((@($passed) + @($failed)) -join ', ')" }
+    }
+    elseif ($expected.Count -eq 0) {
         if ($exit -ne 0) { $problems += "expected exit 0, got $exit" }
-        $missing = @($allIds | Where-Object { $_ -notin $passed })
+        $missing = @($ids | Where-Object { $_ -notin $passed })
         if ($missing) { $problems += "assertions not reported as PASS: $($missing -join ', ')" }
-        if ($text -notmatch "Summary: $($allIds.Count) passed, 0 failed") { $problems += 'summary line missing or wrong' }
+        if ($text -notmatch "Summary: $($ids.Count) passed, 0 failed") { $problems += 'summary line missing or wrong' }
     }
     else {
         if ($exit -eq 0) { $problems += 'expected non-zero exit, got 0' }
@@ -146,7 +172,7 @@ function Invoke-Scenario($Scenario) {
         if ($notFailed) { $problems += "expected FAIL but not reported: $($notFailed -join ', ')" }
         if ($text -notmatch "Summary: \d+ passed, $($expected.Count) failed") { $problems += "summary does not say $($expected.Count) failed" }
         # Every assertion must still be accounted for (PASS or FAIL), whatever failed.
-        $unaccounted = @($allIds | Where-Object { $_ -notin $passed -and $_ -notin $failed })
+        $unaccounted = @($ids | Where-Object { $_ -notin $passed -and $_ -notin $failed })
         if ($unaccounted) { $problems += "assertions neither PASS nor FAIL: $($unaccounted -join ', ')" }
     }
     if ($Scenario.Check) {
@@ -158,8 +184,8 @@ function Invoke-Scenario($Scenario) {
 }
 
 # ------------------------------------------------------------------ scenarios
-function S($Name, $ExpectFail, $Mutate, $Check = $null, [switch] $UseServiceEndpoint) {
-    [pscustomobject]@{ Name = $Name; ExpectFail = $ExpectFail; Mutate = $Mutate; Check = $Check; UseServiceEndpoint = [bool]$UseServiceEndpoint }
+function S($Name, $ExpectFail, $Mutate, $Check = $null, [switch] $UseServiceEndpoint, $Ids = $null, $ExpectExit = $null) {
+    [pscustomobject]@{ Name = $Name; ExpectFail = $ExpectFail; Mutate = $Mutate; Check = $Check; UseServiceEndpoint = [bool]$UseServiceEndpoint; Ids = $Ids; ExpectExit = $ExpectExit }
 }
 
 $privateIpPattern = '(?m)^PASS \[private-endpoint-ip\].*10\.20\.2\.4'
@@ -259,6 +285,43 @@ $scenarios = @(
         if ($r.Text -notlike '*leaked-credentials*') { 'offending secret name not reported' }
     }
 )
+
+# ------------------------------------------------------------------ negative-mode scenarios (ticket 06)
+# The fake app turns "auth broken" only when its pod restarts (fake kubectl `rollout restart`) while the federated
+# credential (fake az `update`, same file) has no valid subject, like a real token exchange at pod start.
+function Get-FedCreds($R) { @(Get-Content -Raw (Join-Path $R.Dir 'federated-credentials.json') | ConvertFrom-Json) }
+function Get-AzUpdates($R) { @($R.Calls -split "`n" | Where-Object { $_ -like 'az identity federated-credential update *' }) }
+function Get-Restarts($R) { @($R.Calls -split "`n" | Where-Object { $_ -like '*rollout restart*' }) }
+$negArgs = @{ NegativeTest = $true; Force = $true; PropagationTimeoutSeconds = 20 }
+# Common post-conditions of every negative run that got as far as changing the credential.
+function Test-CredentialRestored($R) {
+    $e = @()
+    $c = Get-FedCreds $R
+    if ($c.Count -ne 1 -or $c[0].subject -ne $originalSubject -or $c[0].name -ne 'aks-poc-ehpoc' `
+            -or $c[0].issuer -ne 'https://oidc.example.invalid/00000000-0000-0000-0000-000000000002/' -or ($c[0].audiences -join ',') -ne 'api://AzureADTokenExchange') {
+        $e += "credential NOT restored to the original: $($c | ConvertTo-Json -Compress)"
+    }
+    if (Test-Path (Join-Path $R.Dir 'federated-credential-original.json')) { $e += 'backup file left behind after a verified restore' }
+    $e
+}
+
+$negativeScenarios = @(
+    S 'negative-full-cycle' @() { param($d) $d.ScriptArgs = $negArgs } -Ids $negIds -Check {
+        param($r)
+        $e = @()
+        $e += Test-CredentialRestored $r
+        $u = @(Get-AzUpdates $r)
+        if ($u.Count -ne 2) { $e += "expected 2 credential updates (break, restore), got $($u.Count)" }
+        else {
+            $subjects = @($u | ForEach-Object { if ($_ -match ' --subject (\S+)') { $Matches[1] } })
+            if ($subjects.Count -ne 2 -or $subjects[0] -eq $originalSubject) { $e += "break must set a subject that cannot match; subjects passed: $($subjects -join ' then ')" }
+            elseif ($subjects[1] -ne $originalSubject) { $e += 'restore must set the original subject' }
+        }
+        if (@(Get-Restarts $r).Count -lt 2) { $e += 'pod was not restarted after the break and after the restore' }
+        $e
+    }
+)
+$scenarios += $negativeScenarios
 
 # ------------------------------------------------------------------ run
 $failures = 0
