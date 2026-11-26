@@ -1,0 +1,22 @@
+# Rendered by scripts/deploy.ps1, which fills the CALLER_IP placeholder below with the caller's public IP.
+# One public load balancer IP, HTTP only, reachable only from the caller's IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ehpoc
+  namespace: poc
+  annotations:
+    # Azure LB health probe: HTTP against the actuator (the default "/" path would 404).
+    service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path: /actuator/health
+spec:
+  type: LoadBalancer
+  selector:
+    app: ehpoc
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+      appProtocol: http
+  loadBalancerSourceRanges:
+    - "${CALLER_IP}/32"

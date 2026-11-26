@@ -1,0 +1,93 @@
+# Rendered by scripts/deploy.ps1, which fills the dollar-brace placeholders below (IMAGE with the ACR image
+# reference, EVENTHUBS_NAMESPACE_FQDN and EVENTHUBS_TOPIC with the Event Hubs host name and event hub name).
+# Nothing secret here and no image-pull credential: the kubelet identity pulls from ACR (AcrPull), and the
+# pod authenticates to Event Hubs with the workload identity token the webhook injects
+# (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE; AZURE_AUTHORITY_HOST).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ehpoc
+  namespace: poc
+  labels:
+    app: ehpoc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ehpoc
+  template:
+    metadata:
+      labels:
+        app: ehpoc
+        # Asks the workload identity webhook to inject the client ID, tenant ID and token file.
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: ehpoc
+      # The app never calls the Kubernetes API, so the default API token is not mounted. Workload identity does
+      # not depend on it: the webhook adds its own projected service account token volume (audience
+      # api://AzureADTokenExchange, mounted at the path in AZURE_FEDERATED_TOKEN_FILE) when the pod is created.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # The numeric user and group of the image's USER (app/Dockerfile), so the kubelet can verify non-root.
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: "${IMAGE}"
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # The app writes only to /tmp (JVM perf data, Tomcat work directory, native library extraction),
+            # which is the emptyDir below. Logs go to stdout.
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Pins the Azure credential chain to workload identity (no fall-through to other sources).
+            - name: AZURE_TOKEN_CREDENTIALS
+              value: WorkloadIdentityCredential
+            # Public namespace name (never the privatelink name or an IP): the OAuth scope derives from it.
+            # The app builds the Kafka bootstrap server as <fqdn>:9093.
+            - name: EVENTHUBS_NAMESPACE_FQDN
+              value: "${EVENTHUBS_NAMESPACE_FQDN}"
+            # The event hub = the Kafka topic.
+            - name: EVENTHUBS_TOPIC
+              value: "${EVENTHUBS_TOPIC}"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            # Spring Boot 4 + the Azure SDK + the Kafka clients is tight at 768Mi (the JVM heap is 75% of the limit).
+            limits:
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 128Mi

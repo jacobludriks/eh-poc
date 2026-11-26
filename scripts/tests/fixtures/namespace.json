@@ -1,0 +1,7 @@
+{
+  "name": "ehpoc-ns-test",
+  "sku": { "name": "Standard", "tier": "Standard", "capacity": 1 },
+  "disableLocalAuth": true,
+  "publicNetworkAccess": "Disabled",
+  "minimumTlsVersion": "1.2"
+}

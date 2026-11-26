@@ -1,0 +1,16 @@
+{
+  "resourceGroup": "rg-test",
+  "location": "australiaeast",
+  "aksName": "ehpoc-aks-test",
+  "endpoint": "http://203.0.113.10",
+  "kubeconfig": "__KUBECONFIG__",
+  "namespace": "poc",
+  "eventHubsNamespace": "ehpoc-ns-test",
+  "eventHubsFqdn": "ehpoc-ns-test.servicebus.windows.net",
+  "eventHubName": "events",
+  "identityName": "ehpoc-id-test",
+  "identityClientId": "00000000-0000-0000-0000-0000000000bb",
+  "identityPrincipalId": "00000000-0000-0000-0000-0000000000aa",
+  "tenantId": "00000000-0000-0000-0000-000000000003",
+  "serviceAccount": "ehpoc"
+}

@@ -1,0 +1,48 @@
+{
+  "app": "ehpoc",
+  "javaVersion": "21.0.0",
+  "hostname": "ehpoc-test-pod",
+  "time": "2026-01-01T00:00:00Z",
+  "eventHubs": {
+    "configured": true,
+    "topic": "events",
+    "bootstrapServer": "ehpoc-ns-test.servicebus.windows.net:9093",
+    "bootstrapHost": "ehpoc-ns-test.servicebus.windows.net",
+    "resolvedIp": "10.20.2.4",
+    "resolvedIpIsPrivate": true,
+    "resolutionError": null
+  },
+  "workloadIdentity": {
+    "AZURE_CLIENT_ID": true,
+    "AZURE_TENANT_ID": true,
+    "AZURE_FEDERATED_TOKEN_FILE": true,
+    "AZURE_TOKEN_CREDENTIALS": "WorkloadIdentityCredential"
+  },
+  "kafka": {
+    "bootstrapServers": ["ehpoc-ns-test.servicebus.windows.net:9093"],
+    "securityProtocol": "SASL_SSL",
+    "saslMechanism": "OAUTHBEARER",
+    "loginCallbackHandlerClass": "com.azure.spring.cloud.service.implementation.kafka.KafkaOAuth2AuthenticateCallbackHandler",
+    "jaasConfigPresent": true,
+    "jaasConfiguredBySpringCloudAzure": true,
+    "passwordlessAutoConfigApplied": true,
+    "credentialPropertiesConfigured": false,
+    "credentialPropertyNames": [],
+    "problems": []
+  },
+  "consumer": {
+    "groupId": "dashboard",
+    "topic": "events",
+    "autoOffsetReset": "latest",
+    "securityProtocol": "SASL_SSL",
+    "saslMechanism": "OAUTHBEARER",
+    "listenerRunning": true,
+    "assignedPartitions": 2,
+    "bufferedCount": 0,
+    "bufferCapacity": 200,
+    "sseClients": 0,
+    "lastConsumedAt": null,
+    "lastErrorClass": null,
+    "lastErrorAt": null
+  }
+}

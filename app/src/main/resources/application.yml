@@ -1,0 +1,69 @@
+spring:
+  application:
+    name: ehpoc
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+  kafka:
+    # Event Hubs Kafka endpoint: the public namespace name (never the privatelink name or an IP; the OAuth scope
+    # derives from it), port 9093, exactly ONE server. Anything else silently disables Spring Cloud Azure's
+    # passwordless auto-configuration, which /api/diagnostics reports (kafka.passwordlessAutoConfigApplied).
+    # The empty default only keeps the app (and diagnostics) up when the variable is missing; sends then fail.
+    bootstrap-servers: ${EVENTHUBS_NAMESPACE_FQDN:}:9093
+    # Deliberately NO security, sasl, jaas, credential or managed-identity settings here: the base Spring Cloud
+    # Azure starter adds SASL_SSL + OAUTHBEARER + its callback handler, and the credential chain resolves the
+    # workload identity from the webhook-injected AZURE_* environment variables.
+    properties:
+      # Event Hubs recommended client tuning: keep idle and metadata ages below the 240 s service idle limit.
+      "[metadata.max.age.ms]": 180000
+      "[connections.max.idle.ms]": 180000
+    producer:
+      compression-type: none
+      properties:
+        "[request.timeout.ms]": 60000
+        "[max.request.size]": 1000000
+        # Bounds how long send() blocks on login/metadata, so an unreachable or unauthorised hub fails fast
+        # (kept below the HTTP-level acknowledgement wait in EventPublisher).
+        "[max.block.ms]": 20000
+    consumer:
+      # Kafka consumer group "dashboard" (auto-created by Event Hubs; no Event Hubs consumer-group resource needed).
+      group-id: dashboard
+      # A group with no committed offset starts at the end; with committed offsets a restart resumes, not replays.
+      auto-offset-reset: latest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        "[session.timeout.ms]": 30000
+    listener:
+      # Offsets are committed by the container (the app never commits manually), at most about once a second:
+      # Event Hubs throttles consumer-group offset commits to 2 per second per partition.
+      ack-mode: time
+      ack-time: 1s
+      # If the broker rejects the identity (token refused, or the role assignment has not propagated yet), keep
+      # the consumer and retry every 10 s instead of stopping it; the failure is shown in /api/diagnostics.
+      auth-exception-retry-interval: 10s
+    admin:
+      # Topics cannot be created over the Kafka protocol on Event Hubs, and nothing declares a NewTopic.
+      fail-fast: false
+
+# The event hub (= Kafka topic), created by Bicep.
+ehpoc:
+  eventhubs:
+    topic: ${EVENTHUBS_TOPIC:events}
+  sse:
+    # Comment line sent to every open event stream so idle intermediaries do not drop the connection.
+    heartbeat-interval: 15s
+
+server:
+  port: 8080
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
