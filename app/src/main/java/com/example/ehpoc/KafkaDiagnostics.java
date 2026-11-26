@@ -3,13 +3,13 @@ package com.example.ehpoc;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.regex.Pattern;
 
 import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.EnumerablePropertySource;
@@ -36,10 +36,30 @@ public class KafkaDiagnostics {
     /** Marker option Spring Cloud Azure adds to the JAAS configuration when it configured the client. */
     private static final String AZURE_JAAS_MARKER = "azure.configured";
 
-    /** Spring property names (relaxed, dotted form) that would mean a credential is configured in the application. */
-    private static final Pattern CREDENTIAL_PROPERTY = Pattern.compile(
-            "^spring\\.cloud\\.azure\\..*(credential|client\\.?secret|client\\.?certificate|managed\\.?identity|connection\\.?string|password|username|token|sas|key).*"
-                    + "|^spring\\.kafka\\..*(sasl|security|jaas|password|secret|ssl|credential).*");
+    /** Prefixes (as name segments) of the Spring property families that can configure how the app authenticates. */
+    private static final List<String> AZURE_PREFIX = List.of("spring", "cloud", "azure");
+    private static final List<String> KAFKA_PREFIX = List.of("spring", "kafka");
+
+    /**
+     * Name segment sequences that mean a credential is configured under {@code spring.cloud.azure.*}: client secret
+     * or certificate, user name or password, managed identity (which forces IMDS and bypasses the federated token),
+     * connection string, SAS and shared access keys/signatures, account and access keys, token credential beans,
+     * and any SASL/JAAS override.
+     * A multi-word sequence also matches its run-together form (relaxed binding accepts {@code clientsecret}).
+     */
+    private static final List<List<String>> AZURE_CREDENTIAL_SEGMENTS = List.of(
+            List.of("client", "secret"), List.of("client", "certificate"), List.of("secret"), List.of("certificate"),
+            List.of("password"), List.of("username"), List.of("managed", "identity"), List.of("connection", "string"),
+            List.of("sas"), List.of("shared", "access"), List.of("access", "key"), List.of("account", "key"),
+            List.of("token", "credential"), List.of("sasl"), List.of("jaas"));
+
+    /**
+     * Name segments that mean the application itself supplies authentication under {@code spring.kafka.*}: any SASL
+     * or JAAS setting (the passwordless one is added by Spring Cloud Azure, never set here), or a password, secret
+     * or credential. TLS settings such as {@code ssl.keystore.type} are not credentials.
+     */
+    private static final List<List<String>> KAFKA_CREDENTIAL_SEGMENTS = List.of(
+            List.of("sasl"), List.of("jaas"), List.of("password"), List.of("secret"), List.of("credential"));
 
     /** Environment variables (exact names) that would bypass the federated workload identity token. */
     private static final Set<String> CREDENTIAL_ENV_VARS = Set.of(
@@ -58,12 +78,13 @@ public class KafkaDiagnostics {
         Map<String, Object> config = producerFactory.getConfigurationProperties();
 
         List<String> bootstrapServers = bootstrapServers(config.get("bootstrap.servers"));
-        String securityProtocol = asString(config.get("security.protocol"));
-        String saslMechanism = asString(config.get("sasl.mechanism"));
-        String handlerClass = asString(config.get("sasl.login.callback.handler.class"));
-        String jaas = asString(config.get("sasl.jaas.config"));
-        boolean jaasPresent = jaas != null && !jaas.isBlank();
-        boolean jaasMarkedByAzure = jaasPresent && jaas.contains(AZURE_JAAS_MARKER);
+        String securityProtocol = KafkaConfigValues.asString(config.get("security.protocol"));
+        String saslMechanism = KafkaConfigValues.asString(config.get("sasl.mechanism"));
+        String handlerClass = KafkaConfigValues.asString(config.get("sasl.login.callback.handler.class"));
+        // The JAAS configuration is a Kafka Password: only its presence and Azure's marker are read, never returned.
+        Object jaas = config.get("sasl.jaas.config");
+        boolean jaasPresent = KafkaConfigValues.isPresent(jaas);
+        boolean jaasMarkedByAzure = KafkaConfigValues.contains(jaas, AZURE_JAAS_MARKER);
         Set<String> credentialProperties = credentialPropertyNames();
 
         List<String> problems = new ArrayList<>();
@@ -118,16 +139,34 @@ public class KafkaDiagnostics {
         return Arrays.stream(String.valueOf(value).split(",")).map(String::trim).filter(s -> !s.isEmpty()).toList();
     }
 
-    private static String asString(Object value) {
-        if (value == null) {
-            return null;
+    /**
+     * Whether a property or environment variable NAME supplies a credential. Names are compared by whole segments
+     * (split on dots, dashes, underscores, brackets and camelCase humps), so {@code client-secret},
+     * {@code clientSecret} and {@code SPRING_CLOUD_AZURE_CREDENTIAL_CLIENT_SECRET} all match, while
+     * {@code ssl.keystore.type} or {@code kafka.keys} do not match merely because they contain "key", "sas" or "ssl".
+     */
+    static boolean isCredentialProperty(String name) {
+        if (CREDENTIAL_ENV_VARS.contains(name)) {
+            return true;
         }
-        if (value instanceof Class<?> type) {
-            return type.getName();
+        List<String> segments = Arrays.stream(name.replaceAll("([a-z0-9])([A-Z])", "$1.$2")
+                .toLowerCase(Locale.ROOT).split("[^a-z0-9]+")).filter(s -> !s.isEmpty()).toList();
+        if (startsWith(segments, AZURE_PREFIX)) {
+            return containsAny(segments.subList(AZURE_PREFIX.size(), segments.size()), AZURE_CREDENTIAL_SEGMENTS);
         }
-        // A password-typed Kafka config (the JAAS configuration) renders as a masked value and is only used for
-        // presence and marker checks, never returned.
-        return value instanceof org.apache.kafka.common.config.types.Password password ? password.value() : value.toString();
+        if (startsWith(segments, KAFKA_PREFIX)) {
+            return containsAny(segments.subList(KAFKA_PREFIX.size(), segments.size()), KAFKA_CREDENTIAL_SEGMENTS);
+        }
+        return false;
+    }
+
+    private static boolean startsWith(List<String> segments, List<String> prefix) {
+        return segments.size() >= prefix.size() && segments.subList(0, prefix.size()).equals(prefix);
+    }
+
+    private static boolean containsAny(List<String> segments, List<List<String>> sequences) {
+        return sequences.stream().anyMatch(sequence -> Collections.indexOfSubList(segments, sequence) >= 0
+                || (sequence.size() > 1 && segments.contains(String.join("", sequence))));
     }
 
     /** Names (never values) of configured properties and variables that would supply a credential. */
@@ -136,8 +175,7 @@ public class KafkaDiagnostics {
         for (PropertySource<?> source : environment.getPropertySources()) {
             if (source instanceof EnumerablePropertySource<?> enumerable) {
                 for (String name : enumerable.getPropertyNames()) {
-                    String relaxed = name.toLowerCase(Locale.ROOT).replace('_', '.').replace('-', '.');
-                    if (CREDENTIAL_ENV_VARS.contains(name) || CREDENTIAL_PROPERTY.matcher(relaxed).matches()) {
+                    if (isCredentialProperty(name)) {
                         names.add(name);
                     }
                 }

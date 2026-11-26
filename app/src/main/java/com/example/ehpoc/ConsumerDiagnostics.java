@@ -43,11 +43,11 @@ public class ConsumerDiagnostics {
         Collection<TopicPartition> assigned = container == null ? null : container.getAssignedPartitions();
 
         Map<String, Object> consumer = new LinkedHashMap<>();
-        consumer.put("groupId", asString(config.get("group.id")));
+        consumer.put("groupId", KafkaConfigValues.asString(config.get("group.id")));
         consumer.put("topic", topic);
-        consumer.put("autoOffsetReset", asString(config.get("auto.offset.reset")));
-        consumer.put("securityProtocol", asString(config.get("security.protocol")));
-        consumer.put("saslMechanism", asString(config.get("sasl.mechanism")));
+        consumer.put("autoOffsetReset", KafkaConfigValues.asString(config.get("auto.offset.reset")));
+        consumer.put("securityProtocol", KafkaConfigValues.asString(config.get("security.protocol")));
+        consumer.put("saslMechanism", KafkaConfigValues.asString(config.get("sasl.mechanism")));
         consumer.put("listenerRunning", container != null && container.isRunning());
         // Greater than zero once the group has been joined; events sent before that are skipped (offset reset "latest").
         consumer.put("assignedPartitions", assigned == null ? 0 : assigned.size());
@@ -58,9 +58,5 @@ public class ConsumerDiagnostics {
         consumer.put("lastErrorClass", status.lastErrorClass());
         consumer.put("lastErrorAt", status.lastErrorAt() == null ? null : status.lastErrorAt().toString());
         return consumer;
-    }
-
-    private static String asString(Object value) {
-        return value == null ? null : value.toString();
     }
 }
