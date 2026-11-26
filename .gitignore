@@ -7,3 +7,7 @@ target/
 kubeconfig*
 .deploy-state/
 .claude/
+
+# Local agent working files (not published)
+.scratch/
+CLAUDE.md
