@@ -5,7 +5,7 @@ API contract from ticket 04, canned data) and fake `az` / `kubectl` shims that a
 only. Needs only `pwsh` 7.3+. It never contacts Azure or a cluster.
 
 ```powershell
-pwsh -File scripts/tests/smoke-test.tests.ps1                  # all scenarios (about 2 minutes)
+pwsh -File scripts/tests/smoke-test.tests.ps1                  # all scenarios (about 3 minutes)
 pwsh -File scripts/tests/smoke-test.tests.ps1 -Only 'roles-*'  # a subset, by scenario name wildcard
 pwsh -File scripts/tests/smoke-test.tests.ps1 -ShowOutput      # also print the smoke-test output when a scenario is ok
 ```
@@ -22,6 +22,31 @@ makes exactly the named assertion(s) FAIL with a non-zero exit.
 - `smoke-test.tests.ps1`: the scenario table. A scenario is a name, the assertion ids that must FAIL (empty means
   all pass) and a `Mutate` scriptblock that edits the fixture data. `$allIds` there is the independent list of
   assertions the script must report; keep it in step with `smoke-test.ps1`.
+
+## Negative mode (`-NegativeTest`, `-RestoreFederatedCredential`)
+
+The opt-in negative test breaks the federated credential, so it is only ever run here against the fakes. The fake
+app models workload identity the way the real one behaves: a token is exchanged when the pod starts, so the fake
+`kubectl rollout restart` calls the fake app's test-only `POST /__fake/restart`, which reads the same
+`federated-credentials.json` the fake `az identity federated-credential update` rewrites. After a restart with no
+credential for the valid subject the app answers `POST /api/events` with 503 (`BrokenReason`, default
+`authentication`) and diagnostics show no assigned partitions and a `lastErrorClass` (`BrokenLastErrorClass`).
+Fake-app switches: `FederationLagRestarts` (Entra propagation delay, counted in restarts, both directions),
+`IgnoreFederation` (the change never takes effect), `AuthBroken` (a pod that starts out broken). Shim switches
+(per-scenario files): `update-fail-calls.txt` (comma list of update call numbers that fail) and
+`fail-rollout-restart`.
+
+Scenarios (`negative-*`, `restore-switch-*`) cover: the full cycle (baseline, break, expected failure attributed to
+authentication, restore, recovery); refusal without confirmation / with a leftover backup / when the credential is
+already broken / with several credentials (exit 2, nothing changed); a failing baseline changes nothing; failures
+that are not authentication (unavailable, authorization) are not attributed to it, while a timeout whose consumer
+error is a login failure is; propagation lag in both directions; a change with no effect (reported, still
+restored); an error mid-run, a flaky restore (retried), an impossible restore (loud, backup kept) and a stopped run
+(the script is stopped inside a runspace, the same stop Ctrl-C causes) all end with the credential restored where
+restoring is possible; and the recovery switch (restores from the saved file, restarts, checks the round trip; does
+nothing without a saved file; refuses a file from another identity). A standard run is also checked to make no
+credential update and no restart. A scenario can set `Ids` (the full id set it expects, for runs that are not the
+standard set) and `ExpectExit` (a setup problem: no assertion may be reported).
 
 These tests cannot prove the real system: the real SASL handshake, DNS, role propagation and Azure resource
 properties are only exercised by running `scripts/smoke-test.ps1` against a live deployment.

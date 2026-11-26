@@ -21,6 +21,18 @@
   Tokens and secret values are never read into the output: only booleans, class names, ids of events the script
   itself sent, and resource names are printed.
 
+  OPT-IN NEGATIVE TEST (ticket 06), the only mode that changes infrastructure:
+    pwsh -File scripts/smoke-test.ps1 -NegativeTest [-Force] [-PropagationTimeoutSeconds 600]
+  It TEMPORARILY BREAKS the federated credential of the deployed PoC to prove the success is caused by workload
+  identity: baseline round trip, save the original credential under .deploy-state/, change its subject, restart the
+  pod (a token is only exchanged at startup) until the send fails, assert the failure is an authentication failure,
+  restore the exact original (try/finally: also on a failed assertion, an error or Ctrl-C), restart, and expect the
+  round trip to pass again. It asks for confirmation unless -Force. If a run is killed midway:
+    pwsh -File scripts/smoke-test.ps1 -RestoreFederatedCredential
+  Assertion ids: negative-baseline(-*), negative-credential-broken, negative-auth-fails, negative-attributed-to-auth,
+  negative-credential-restored, negative-restored(-*). The standard assertions are not run in this mode (the
+  federated-subject one would fail while the credential is broken). Same exit codes as a standard run.
+
   Structure (for extending, e.g. the negative federated-credential test, ticket 06):
     - Assert-That             records one assertion (id, label, outcome, detail). Everything goes through it.
     - Invoke-Api / Open-Sse   the only HTTP code. Invoke-Az / Invoke-Kubectl are the only az / kubectl calls.

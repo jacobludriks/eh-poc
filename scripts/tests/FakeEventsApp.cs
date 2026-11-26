@@ -52,7 +52,7 @@ public sealed class FakeEventsApp : IDisposable
     public int FederationLagRestarts { get; set; }
     public string BrokenReason { get; set; } = "authentication";
     public string BrokenLastErrorClass { get; set; } = "org.apache.kafka.common.KafkaException <- javax.security.auth.login.LoginException";
-    public bool AuthBroken { get { lock (gate) return authBroken; } }
+    public bool AuthBroken { get { lock (gate) return authBroken; } set { lock (gate) authBroken = value; } }   // settable: a pod that starts out broken
     bool authBroken;
 
     public List<string> RequestLog { get; } = new List<string>();

@@ -75,6 +75,27 @@ foreach ($tool in 'az', 'kubectl') {
     }
 }
 
+# Driver for the "interrupted run" scenario: runs the smoke test in a runspace, stops it (like Ctrl-C) as soon as the
+# fake kubectl logs the first `rollout restart`, which in -NegativeTest mode is the restart after the break
+# (the baseline does not restart), then prints what the script wrote and the stop's outcome.
+$interruptDriver = Join-Path $work 'interrupt-driver.ps1'
+Set-Content -Path $interruptDriver -Value @'
+param([string] $Script, [string] $ArgsFile, [string] $CallsLog)
+$h = @{}
+(Get-Content -Raw $ArgsFile | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }
+$ps = [powershell]::Create()
+$null = $ps.AddScript('param($s, $a) & $s @a').AddArgument($Script).AddArgument($h)
+$async = $ps.BeginInvoke()
+$deadline = [DateTime]::UtcNow.AddSeconds(60)
+while (-not $async.IsCompleted -and [DateTime]::UtcNow -lt $deadline) {
+    if ((Test-Path $CallsLog) -and (Get-Content -Raw $CallsLog) -like '*rollout restart*') { Start-Sleep -Milliseconds 200; $ps.Stop(); break }
+    Start-Sleep -Milliseconds 100
+}
+try { $null = $ps.EndInvoke($async); Write-Output 'driver: script ended normally' }
+catch { Write-Output "driver: script stopped ($($_.Exception.GetType().Name))" }
+foreach ($i in $ps.Streams.Information) { Write-Output "$($i.MessageData)" }
+'@
+
 function Read-Fixture([string] $Name) { Get-Content -Raw -Path (Join-Path $fixtures $Name) | ConvertFrom-Json }
 function ConvertTo-FixtureJson($Value) { ConvertTo-Json -InputObject $Value -Depth 20 }
 
@@ -137,6 +158,16 @@ function Invoke-Scenario($Scenario) {
         else { $childArgs += "-$k"; $childArgs += [string]$argList[$k] }
     }
 
+    if ($Scenario.InterruptDuringBreak) {
+        # Run the script inside a runspace and Stop() it once the pod restart after the break has been requested:
+        # the same stop Ctrl-C causes (finally blocks run, the script never reaches its normal end).
+        $hash = [ordered]@{}
+        foreach ($k in $argList.Keys) { $hash[$k] = $argList[$k] }
+        Set-Content -Path (Join-Path $dir 'script-args.json') -Value ($hash | ConvertTo-Json)
+        $childArgs = @('-NoProfile', '-NonInteractive', '-File', $interruptDriver, '-Script', $smokeScript,
+            '-ArgsFile', (Join-Path $dir 'script-args.json'), '-CallsLog', (Join-Path $dir 'calls.log'))
+    }
+
     # The shims are on PATH for this child process only (restored right after).
     $oldPath = $env:PATH
     $env:PATH = $shimDir + [IO.Path]::PathSeparator + $env:PATH
@@ -153,7 +184,12 @@ function Invoke-Scenario($Scenario) {
     $problems = @()
     $expected = @($Scenario.ExpectFail)
     $ids = if ($Scenario.Ids) { @($Scenario.Ids) } else { $allIds }
-    if ($null -ne $Scenario.ExpectExit) {
+    if ($Scenario.InterruptDuringBreak) {
+        # Stopped midway: there is no summary or exit code to judge, only that it was stopped and what the Check finds.
+        if ($text -notlike '*driver: script stopped*') { $problems += 'the script was not stopped midway (interrupt did not happen)' }
+        if ($text -like '*Summary:*') { $problems += 'the script ran to its end, so nothing was interrupted' }
+    }
+    elseif ($null -ne $Scenario.ExpectExit) {
         # A setup problem (exit 2): nothing is asserted, so no PASS/FAIL line may appear.
         if ($exit -ne $Scenario.ExpectExit) { $problems += "expected exit $($Scenario.ExpectExit), got $exit" }
         if ($passed -or $failed) { $problems += "no assertion should have run, saw: $((@($passed) + @($failed)) -join ', ')" }
@@ -184,8 +220,8 @@ function Invoke-Scenario($Scenario) {
 }
 
 # ------------------------------------------------------------------ scenarios
-function S($Name, $ExpectFail, $Mutate, $Check = $null, [switch] $UseServiceEndpoint, $Ids = $null, $ExpectExit = $null) {
-    [pscustomobject]@{ Name = $Name; ExpectFail = $ExpectFail; Mutate = $Mutate; Check = $Check; UseServiceEndpoint = [bool]$UseServiceEndpoint; Ids = $Ids; ExpectExit = $ExpectExit }
+function S($Name, $ExpectFail, $Mutate, $Check = $null, [switch] $UseServiceEndpoint, $Ids = $null, $ExpectExit = $null, [switch] $InterruptDuringBreak) {
+    [pscustomobject]@{ Name = $Name; ExpectFail = $ExpectFail; Mutate = $Mutate; Check = $Check; UseServiceEndpoint = [bool]$UseServiceEndpoint; Ids = $Ids; ExpectExit = $ExpectExit; InterruptDuringBreak = [bool]$InterruptDuringBreak }
 }
 
 $privateIpPattern = '(?m)^PASS \[private-endpoint-ip\].*10\.20\.2\.4'
@@ -199,6 +235,10 @@ $scenarios = @(
             if ($r.Calls -notlike "*$needle*") { $e += "az/kubectl never called with '$needle' (state not used?)" }
         }
         if ($r.Server.RequestLog -notcontains 'POST /api/events/clear') { $e += 'clear was never called' }
+        # A normal run never changes infrastructure: no credential update, no pod restart.
+        if ($r.Calls -like '*federated-credential update*') { $e += 'standard run changed the federated credential' }
+        if ($r.Calls -like '*rollout*') { $e += 'standard run restarted the deployment' }
+        if ($r.Server.RequestLog -contains 'POST /__fake/restart') { $e += 'standard run restarted the pod' }
         $e
     }
     S 'healthy-with-sa-token-secret' @() { param($d) $d.Secrets.items = @([pscustomobject]@{ type = 'kubernetes.io/service-account-token'; metadata = [pscustomobject]@{ name = 'sa-token' } }) }
@@ -293,6 +333,8 @@ function Get-FedCreds($R) { @(Get-Content -Raw (Join-Path $R.Dir 'federated-cred
 function Get-AzUpdates($R) { @($R.Calls -split "`n" | Where-Object { $_ -like 'az identity federated-credential update *' }) }
 function Get-Restarts($R) { @($R.Calls -split "`n" | Where-Object { $_ -like '*rollout restart*' }) }
 $negArgs = @{ NegativeTest = $true; Force = $true; PropagationTimeoutSeconds = 20 }
+# $negArgs with overrides/additions (a hashtable + cannot repeat a key).
+function Get-NegArgs([hashtable] $Extra) { $a = $negArgs.Clone(); foreach ($k in $Extra.Keys) { $a[$k] = $Extra[$k] }; $a }
 # Common post-conditions of every negative run that got as far as changing the credential.
 function Test-CredentialRestored($R) {
     $e = @()
@@ -320,6 +362,138 @@ $negativeScenarios = @(
         if (@(Get-Restarts $r).Count -lt 2) { $e += 'pod was not restarted after the break and after the restore' }
         $e
     }
+)
+$baselineIds = @('negative-baseline') + @($roundTripIds | ForEach-Object { "negative-baseline-$_" })
+$restoredIds = @('negative-restored') + @($roundTripIds | ForEach-Object { "negative-restored-$_" })
+$phaseIds = 'negative-credential-broken', 'negative-auth-fails', 'negative-attributed-to-auth', 'negative-credential-restored'
+$unchanged = { param($r) if (@(Get-AzUpdates $r).Count -or @(Get-Restarts $r).Count) { 'infrastructure was changed (credential update or restart)' } }
+# What a scenario with a saved original in the scenario directory looks like (the same values as the fixture).
+$backupJson = ConvertTo-Json -Compress -InputObject ([pscustomobject]@{
+        identityName = 'ehpoc-id-test'; resourceGroup = 'rg-test'; name = 'aks-poc-ehpoc'; subject = $originalSubject
+        issuer = 'https://oidc.example.invalid/00000000-0000-0000-0000-000000000002/'; audiences = @('api://AzureADTokenExchange'); savedAt = '2026-01-01T00:00:00Z' })
+
+$negativeScenarios += @(
+    # ---- the safety rails: nothing may change
+    S 'negative-needs-confirmation' @() { param($d) $d.ScriptArgs = @{ NegativeTest = $true; PropagationTimeoutSeconds = 20 } } -ExpectExit 2 -Check {
+        param($r)
+        $e = @(& $unchanged $r)
+        if ($r.Text -notlike '*TEMPORARILY BREAKS the federated credential*') { $e += 'warning not shown' }
+        if ($r.Text -notlike '*-Force*') { $e += 'does not tell how to confirm non-interactively' }
+        $e
+    }
+    S 'negative-switches-exclusive' @() { param($d) $d.ScriptArgs = (Get-NegArgs @{ RestoreFederatedCredential = $true }) } -ExpectExit 2 -Check $unchanged
+    S 'negative-refuses-when-backup-exists' @() {
+        param($d) $d.ScriptArgs = $negArgs; $d.ExtraFiles = @{ 'federated-credential-original.json' = $backupJson }
+    } -ExpectExit 2 -Check {
+        param($r)
+        $e = @(& $unchanged $r)
+        if ($r.Text -notlike '*-RestoreFederatedCredential*') { $e += 'does not point to the recovery switch' }
+        $e
+    }
+    S 'negative-refuses-when-already-broken' @() { param($d) $d.ScriptArgs = $negArgs; $d.Federated[0].subject = 'system:serviceaccount:poc:somethingelse' } -ExpectExit 2 -Check $unchanged
+    S 'negative-refuses-with-two-credentials' @() {
+        param($d)
+        $d.ScriptArgs = $negArgs
+        $d.Federated = @($d.Federated + [pscustomobject]@{ name = 'extra'; issuer = 'https://oidc.example.invalid/x/'; subject = 'system:serviceaccount:default:default'; audiences = @('api://AzureADTokenExchange') })
+    } -ExpectExit 2 -Check $unchanged
+    S 'negative-baseline-fails-changes-nothing' (@('negative-baseline', 'negative-baseline-consumer-ready', 'negative-baseline-send-accepted', 'negative-baseline-list-roundtrip', 'negative-baseline-sse-delivery', 'negative-restored') + $phaseIds) {
+        param($d) $d.ScriptArgs = $negArgs; $d.Diag.consumer.assignedPartitions = 0
+    } -Ids ($baselineIds + $phaseIds + 'negative-restored') -Check {
+        param($r)
+        $e = @(& $unchanged $r)
+        if (Test-Path (Join-Path $r.Dir 'federated-credential-original.json')) { $e += 'wrote a backup although nothing was changed' }
+        $e
+    }
+
+    # ---- expected failure leg: attribution
+    S 'negative-auth-reported-by-consumer-only' @() {
+        # The send times out (no reason) but the consumer's last error is a login failure: still attributed to auth.
+        param($d) $d.ScriptArgs = $negArgs; $d.Server = @{ BrokenReason = 'timeout' }
+    } -Ids $negIds
+    S 'negative-failure-not-authentication' @('negative-attributed-to-auth') {
+        param($d) $d.ScriptArgs = $negArgs; $d.Server = @{ BrokenReason = 'unavailable'; BrokenLastErrorClass = 'org.apache.kafka.common.errors.TimeoutException' }
+    } -Ids $negIds -Check { param($r) Test-CredentialRestored $r }
+    S 'negative-failure-is-authorization-not-authentication' @('negative-attributed-to-auth') {
+        param($d) $d.ScriptArgs = $negArgs; $d.Server = @{ BrokenReason = 'authorization'; BrokenLastErrorClass = 'org.apache.kafka.common.errors.AuthorizationException' }
+    } -Ids $negIds
+
+    # ---- propagation delay (Entra honours the change only after a few restarts, both ways)
+    S 'negative-propagation-lag' @() {
+        param($d) $d.ScriptArgs = (Get-NegArgs @{ PropagationTimeoutSeconds = 40 }); $d.Server = @{ FederationLagRestarts = 2 }
+    } -Ids $negIds -Check {
+        param($r)
+        $e = Test-CredentialRestored $r
+        # break: lag restart + broken restart; restore: finally restart (lag) + recovery restart.
+        if (@(Get-Restarts $r).Count -lt 4) { $e += "expected at least 4 restarts with propagation lag, got $(@(Get-Restarts $r).Count)" }
+        if ($r.Text -notlike '*may not have propagated*') { $e += 'lag not reported' }
+        $e
+    }
+    S 'negative-credential-change-has-no-effect' @('negative-auth-fails', 'negative-attributed-to-auth') {
+        # Control: the app keeps working, so the test must NOT claim the proof, and must still restore.
+        param($d) $d.ScriptArgs = (Get-NegArgs @{ PropagationTimeoutSeconds = 8 }); $d.Server = @{ IgnoreFederation = $true }
+    } -Ids $negIds -Check { param($r) Test-CredentialRestored $r }
+
+    # ---- the credential is always restored
+    S 'negative-error-mid-run-still-restores' @('negative-run-error', 'negative-auth-fails', 'negative-attributed-to-auth', 'negative-restored') {
+        # kubectl rollout restart fails after the credential was broken: the finally block must restore it anyway.
+        param($d) $d.ScriptArgs = $negArgs; $d.KubectlFailRestart = $true
+    } -Ids ($baselineIds + $phaseIds + 'negative-restored' + 'negative-run-error') -Check { param($r) Test-CredentialRestored $r }
+    S 'negative-restore-retried' @() {
+        # The first restore attempt (update call 2) fails; the retry must succeed.
+        param($d) $d.ScriptArgs = $negArgs; $d.AzUpdateFailCalls = '2'
+    } -Ids $negIds -Check {
+        param($r)
+        $e = Test-CredentialRestored $r
+        if (@(Get-AzUpdates $r).Count -ne 3) { $e += "expected 3 update calls (break, failed restore, restore), got $(@(Get-AzUpdates $r).Count)" }
+        $e
+    }
+    S 'negative-restore-impossible-is-loud' @('negative-credential-restored', 'negative-restored') {
+        param($d) $d.ScriptArgs = $negArgs; $d.AzUpdateFailCalls = '2,3,4'
+    } -Ids ($baselineIds + $phaseIds + 'negative-restored') -Check {
+        param($r)
+        $e = @()
+        if (-not (Test-Path (Join-Path $r.Dir 'federated-credential-original.json'))) { $e += 'backup removed although the restore failed' }
+        if ($r.Text -notlike '*STILL BROKEN*-RestoreFederatedCredential*') { $e += 'no loud instruction to run the recovery switch' }
+        $e
+    }
+
+    S 'negative-interrupted-still-restores' @() {
+        # Ctrl-C equivalent while the credential is broken: the finally block must still restore it.
+        param($d) $d.ScriptArgs = $negArgs
+    } -InterruptDuringBreak -Check {
+        param($r)
+        $e = Test-CredentialRestored $r
+        if ($r.Text -notlike '*PASS [[]negative-credential-broken]*') { $e += 'never got as far as breaking the credential' }
+        if ($r.Text -notlike '*PASS [[]negative-credential-restored]*') { $e += 'no restore confirmation after the interrupt' }
+        $e
+    }
+
+    # ---- recovery switch
+    S 'restore-switch-recovers-a-broken-credential' @() {
+        # A previous run died: the credential is broken, the pod runs broken, the saved original is on disk.
+        param($d)
+        $d.ScriptArgs = @{ RestoreFederatedCredential = $true; PropagationTimeoutSeconds = 20 }
+        $d.Federated[0].subject = "$originalSubject-negative-test"
+        $d.ExtraFiles = @{ 'federated-credential-original.json' = $backupJson }
+        $d.Server = @{ AuthBroken = $true }
+    } -Ids (@('negative-credential-restored') + $restoredIds) -Check {
+        param($r)
+        $e = Test-CredentialRestored $r
+        if (@(Get-Restarts $r).Count -lt 1) { $e += 'pod was not restarted after the restore' }
+        if ($r.Server.AuthBroken) { $e += 'the pod is still broken' }
+        $e
+    }
+    S 'restore-switch-without-saved-state-does-nothing' @() { param($d) $d.ScriptArgs = @{ RestoreFederatedCredential = $true } } -ExpectExit 0 -Check {
+        param($r)
+        $e = @(& $unchanged $r)
+        if ($r.Text -notlike '*nothing to restore*') { $e += 'does not say there is nothing to restore' }
+        $e
+    }
+    S 'restore-switch-refuses-foreign-backup' @() {
+        param($d)
+        $d.ScriptArgs = @{ RestoreFederatedCredential = $true }
+        $d.ExtraFiles = @{ 'federated-credential-original.json' = ($backupJson -replace 'ehpoc-id-test', 'some-other-identity') }
+    } -ExpectExit 2 -Check $unchanged
 )
 $scenarios += $negativeScenarios
 
