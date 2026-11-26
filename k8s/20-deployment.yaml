@@ -23,10 +23,31 @@ spec:
         azure.workload.identity/use: "true"
     spec:
       serviceAccountName: ehpoc
+      # The app never calls the Kubernetes API, so the default API token is not mounted. Workload identity does
+      # not depend on it: the webhook adds its own projected service account token volume (audience
+      # api://AzureADTokenExchange, mounted at the path in AZURE_FEDERATED_TOKEN_FILE) when the pod is created.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # The numeric user and group of the image's USER (app/Dockerfile), so the kubelet can verify non-root.
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: app
           image: "${IMAGE}"
           imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # The app writes only to /tmp (JVM perf data, Tomcat work directory, native library extraction),
+            # which is the emptyDir below. Logs go to stdout.
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           ports:
             - name: http
               containerPort: 8080
@@ -45,8 +66,9 @@ spec:
             requests:
               cpu: 250m
               memory: 512Mi
+            # Spring Boot 4 + the Azure SDK + the Kafka clients is tight at 768Mi (the JVM heap is 75% of the limit).
             limits:
-              memory: 768Mi
+              memory: 1Gi
           startupProbe:
             httpGet:
               path: /actuator/health/liveness
@@ -65,3 +87,7 @@ spec:
               port: http
             periodSeconds: 10
             failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 128Mi
