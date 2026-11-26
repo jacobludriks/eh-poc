@@ -4,7 +4,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArraySet;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
@@ -38,11 +37,7 @@ public class EventStream {
     private final JsonMapper json;
     private final Duration heartbeatInterval;
     private final CopyOnWriteArraySet<SseEmitter> emitters = new CopyOnWriteArraySet<>();
-    private final ScheduledExecutorService sender = Executors.newSingleThreadScheduledExecutor(runnable -> {
-        Thread thread = new Thread(runnable, "sse-sender");
-        thread.setDaemon(true);
-        return thread;
-    });
+    private final ScheduledExecutorService sender = DaemonScheduler.singleThread("sse-sender");
 
     public EventStream(JsonMapper json, @Value("${ehpoc.sse.heartbeat-interval:15s}") Duration heartbeatInterval) {
         this.json = json;
@@ -100,13 +95,7 @@ public class EventStream {
         }
         catch (Exception e) {
             // A dead or stalled client (broken pipe, already completed): drop it, never let it affect the others.
-            emitters.remove(emitter);
-            try {
-                emitter.complete();
-            }
-            catch (Exception ignored) {
-                // already unusable
-            }
+            drop(emitter);
             log.debug("Dropped an SSE client ({})", e.getClass().getSimpleName());
         }
     }
@@ -115,13 +104,18 @@ public class EventStream {
     @EventListener(ContextClosedEvent.class)
     void completeAll() {
         for (SseEmitter emitter : emitters) {
-            emitters.remove(emitter);
-            try {
-                emitter.complete();
-            }
-            catch (Exception ignored) {
-                // already unusable
-            }
+            drop(emitter);
+        }
+    }
+
+    /** Forgets the client and ends its stream; completing an already unusable emitter is not an error. */
+    private void drop(SseEmitter emitter) {
+        emitters.remove(emitter);
+        try {
+            emitter.complete();
+        }
+        catch (Exception ignored) {
+            // already unusable
         }
     }
 

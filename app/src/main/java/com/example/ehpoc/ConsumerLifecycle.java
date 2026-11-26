@@ -1,6 +1,5 @@
 package com.example.ehpoc;
 
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
@@ -34,11 +33,7 @@ public class ConsumerLifecycle {
 
     private final KafkaListenerEndpointRegistry registry;
     private final ConsumerStatus status;
-    private final ScheduledExecutorService supervisor = Executors.newSingleThreadScheduledExecutor(runnable -> {
-        Thread thread = new Thread(runnable, "consumer-supervisor");
-        thread.setDaemon(true);
-        return thread;
-    });
+    private final ScheduledExecutorService supervisor = DaemonScheduler.singleThread("consumer-supervisor");
 
     public ConsumerLifecycle(KafkaListenerEndpointRegistry registry, ConsumerStatus status) {
         this.registry = registry;
