@@ -50,3 +50,10 @@ standard set) and `ExpectExit` (a setup problem: no assertion may be reported).
 
 These tests cannot prove the real system: the real SASL handshake, DNS, role propagation and Azure resource
 properties are only exercised by running `scripts/smoke-test.ps1` against a live deployment.
+
+## Checks for scripts/deploy.ps1 (`deploy.helpers.tests.ps1`)
+
+`pwsh -File scripts/tests/deploy.helpers.tests.ps1` parses every script and unit-checks the pure helpers of
+`deploy.ps1` (IPv4 octet bounds, the role-assignment check against a fake `az`, the "ACR Tasks are blocked" hint and
+the capture pattern around `az acr build`). It extracts the functions from the script's syntax tree, so `deploy.ps1`
+itself is never run and nothing touches Azure. The full deployment is only exercised by really running it.

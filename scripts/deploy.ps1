@@ -20,6 +20,9 @@
      probe event to /api/events, retrying with backoff for up to -VerifyTimeoutSeconds (default 360) because
      Azure role assignments can take up to about five minutes to take effect.
 
+  Before changing anything it checks (read-only, warning only) that you can create role assignments, and if
+  `az acr build` is blocked on the subscription it says so and points at the README.
+
   Requires only the Azure CLI (logged in: `az login`) and PowerShell 7.3+. kubectl is installed through
   the Azure CLI (`az aks install-cli`) if it is missing.
 #>
@@ -56,13 +59,36 @@ function Write-Step([string] $Message) { Write-Host "`n==> $Message" -Foreground
 
 function Test-Command([string] $Name) { [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
 
+function Test-IPv4Address([string] $Value) {
+    # Four dot-separated decimal octets, each 0-255, no leading zeros (which some tools read as octal).
+    $octet = '(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)'
+    return [bool]($Value -match "^$octet(\.$octet){3}\z")
+}
+
+function Test-RoleCanAssignRoles([string[]] $RoleNames) {
+    # Built-in roles that include Microsoft.Authorization/roleAssignments/write (Contributor deliberately does not).
+    $assigners = 'Owner', 'User Access Administrator', 'Role Based Access Control Administrator'
+    return [bool]($RoleNames | Where-Object { $_ -in $assigners })
+}
+
+function Get-AcrBuildBlockedHint([string] $BuildOutput, [string] $Image) {
+    # Returns guidance when `az acr build` failed because ACR Tasks are not permitted on the subscription
+    # (some subscription types, such as free trials or sponsorships, block them); otherwise $null.
+    if ($BuildOutput -notmatch 'TasksOperationsNotAllowed|ACR Tasks requests? .{0,120}not (permitted|allowed)|tasks? (are|is) not (permitted|allowed|supported)') {
+        return $null
+    }
+    return ("ACR Tasks (the remote build behind `az acr build`) are not permitted on this subscription. This is a subscription " +
+        "restriction, not a defect in the app or the templates. Build the image somewhere else and push it to the registry as '$Image', " +
+        'then re-run this script: it finds the image already in ACR and skips the build. See README.md, section "If ACR Tasks are blocked".')
+}
+
 function Get-PublicIp {
     # Plain HTTPS GET to well-known IP echo services; nothing identifying is sent.
     $services = 'https://api.ipify.org', 'https://checkip.amazonaws.com', 'https://ifconfig.me/ip'
     foreach ($url in $services) {
         try {
             $ip = (Invoke-RestMethod -Uri $url -UserAgent 'ehpoc-deploy' -TimeoutSec 15).ToString().Trim()
-            if ($ip -match '^(\d{1,3}\.){3}\d{1,3}$') { return $ip }
+            if (Test-IPv4Address $ip) { return $ip }
         }
         catch { Write-Verbose "IP lookup via $url failed: $($_.Exception.Message)" }
     }
@@ -176,11 +202,49 @@ function Test-PasswordlessProducer([string] $Endpoint, [int] $TimeoutSeconds) {
         '-VerifyTimeoutSeconds, or inspect: kubectl -n poc logs deploy/ehpoc, and ' + "$Endpoint/api/diagnostics.")
 }
 
+function Test-CanCreateRoleAssignments {
+    # READ-ONLY check (only `az account show` and `az role assignment list`) that the signed-in principal holds a role
+    # that can create role assignments, which the templates need for AcrPull and the Event Hubs data roles.
+    # Warns, never blocks: group-based, custom-role, PIM-eligible or deny-assignment setups cannot be judged here.
+    try {
+        $account = az account show -o json | ConvertFrom-Json
+        $userType = [string]$account.user.type
+        if ($userType -notin 'user', 'servicePrincipal') {
+            Write-Warning "Cannot check role-assignment permission for a '$userType' sign-in; continuing. The deployment needs Owner or User Access Administrator."
+            return
+        }
+        $assignee = [string]$account.user.name
+        if ($userType -eq 'user') {
+            # The object ID is more reliable than the sign-in name for guest and external accounts.
+            try { $assignee = (az ad signed-in-user show --query id -o tsv).Trim() } catch { Write-Verbose "signed-in-user lookup failed: $($_.Exception.Message)" }
+        }
+        $roles = @(az role assignment list --assignee $assignee --include-inherited --include-groups `
+                --scope "/subscriptions/$($account.id)" --query '[].roleDefinitionName' -o tsv)
+        if ((az group exists --name $ResourceGroup) -eq 'true') {
+            $roles += @(az role assignment list --assignee $assignee --include-inherited --include-groups `
+                    --resource-group $ResourceGroup --query '[].roleDefinitionName' -o tsv)
+        }
+        if (Test-RoleCanAssignRoles $roles) {
+            Write-Host 'Role assignments: the signed-in principal can create them (Owner / User Access Administrator found).'
+        }
+        else {
+            Write-Warning ("Could not confirm that you can create role assignments at the subscription or resource group '$ResourceGroup'. " +
+                'The deployment creates some (AcrPull, Event Hubs Data Sender/Receiver) and fails with AuthorizationFailed without Owner, ' +
+                'User Access Administrator or Role Based Access Control Administrator. Continuing anyway: this check cannot see ' +
+                'custom roles, PIM-eligible roles or every group membership.')
+        }
+    }
+    catch {
+        Write-Warning "Could not determine whether you can create role assignments ($($_.Exception.Message)); continuing. The deployment needs Owner or User Access Administrator."
+    }
+}
+
 # ---------------------------------------------------------------- preflight
 Write-Step 'Preflight'
 if (-not (Test-Command 'az')) { throw 'Azure CLI (az) not found on PATH.' }
 try { $null = az account show -o none } catch { throw 'Not logged in to Azure. Run `az login` first.' }
 Write-Host "Subscription: $(az account show --query name -o tsv)"
+Test-CanCreateRoleAssignments
 
 # Resource providers a fresh subscription may not have registered yet (no-op when already registered).
 foreach ($ns in 'Microsoft.ContainerService', 'Microsoft.ContainerRegistry', 'Microsoft.Network', 'Microsoft.Compute', 'Microsoft.EventHub', 'Microsoft.ManagedIdentity') {
@@ -202,7 +266,7 @@ if (-not (Test-Command 'kubectl')) {
 # ---------------------------------------------------------------- caller IP (detected once)
 Write-Step 'Caller public IP'
 if (-not $CallerIp) { $CallerIp = Get-PublicIp }
-if ($CallerIp -notmatch '^(\d{1,3}\.){3}\d{1,3}$') { throw "Invalid -CallerIp '$CallerIp' (IPv4 address expected)." }
+if (-not (Test-IPv4Address $CallerIp)) { throw "Invalid -CallerIp '$CallerIp' (IPv4 address expected)." }
 Write-Host "Using $CallerIp for the AKS API server authorized range and the Service source range."
 
 # ---------------------------------------------------------------- infrastructure
@@ -246,7 +310,18 @@ if ($exists) {
 }
 else {
     Write-Host "Building $image in ACR (compiles the app inside the image; no local toolchain)..."
-    az acr build --registry $acrName --image "${imageRepo}:$tag" --file (Join-Path $repoRoot 'app/Dockerfile') (Join-Path $repoRoot 'app')
+    # The source directory is the app folder, so the Dockerfile is addressed relative to it (an absolute local
+    # path would not exist inside the remote build context).
+    $buildLog = [System.Collections.Generic.List[string]]::new()
+    try {
+        az acr build --registry $acrName --image "${imageRepo}:$tag" --file Dockerfile (Join-Path $repoRoot 'app') 2>&1 |
+            ForEach-Object { $line = "$_"; $buildLog.Add($line); Write-Host $line }
+    }
+    catch {
+        $hint = Get-AcrBuildBlockedHint -BuildOutput ((($buildLog -join "`n") + "`n" + $_.Exception.Message)) -Image $image
+        if ($hint) { throw $hint }
+        throw
+    }
 }
 
 # ---------------------------------------------------------------- Kubernetes
@@ -320,6 +395,7 @@ if (-not $healthy) { throw "Health endpoint at $endpoint did not report UP withi
 } | ConvertTo-Json | Set-Content -Path (Join-Path $stateDir 'deploy-outputs.json')
 
 Write-Host "`nDeployed. Endpoint (reachable only from $CallerIp):" -ForegroundColor Green
+Write-Host "  $endpoint/                  (dashboard)"
 Write-Host "  $endpoint/actuator/health"
 Write-Host "  $endpoint/api/diagnostics"
 Write-Host "  POST $endpoint/api/events   {`"message`":`"hello`"}"
