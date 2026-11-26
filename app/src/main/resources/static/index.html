@@ -46,6 +46,7 @@
     font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
   main { max-width: 72rem; margin: 0 auto; padding: 1rem; display: grid; gap: 1rem; }
+  main > * { min-width: 0; }
   h1 { font-size: 1.4rem; margin: 0; }
   h2 { font-size: 1.1rem; margin: 0 0 .75rem; }
   .sub { margin: .25rem 0 0; color: var(--muted); }
@@ -455,9 +456,9 @@
 
     // Authentication method
     var aEl = $('st-auth');
-    var mech = k.saslMechanism || 'unknown';
-    setBadge(aEl, mech === 'OAUTHBEARER' ? 'ok' : 'bad', mech);
-    addText(aEl, ' over ' + (k.securityProtocol || 'unknown protocol'));
+    var mech = k.saslMechanism || 'none';
+    setBadge(aEl, mech === 'OAUTHBEARER' ? 'ok' : 'bad', mech === 'none' ? 'No SASL mechanism' : mech);
+    addText(aEl, ' security protocol: ' + (k.securityProtocol || 'none'));
     if (mech !== 'OAUTHBEARER') { warnings.push('SASL mechanism is not OAUTHBEARER.'); }
 
     // Workload identity
