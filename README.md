@@ -16,8 +16,12 @@ Kafka protocol with **no password, connection string or SAS key**, authenticatin
   credential properties are configured.
 - Stack: Java 21, Spring Boot 4.1.2, Spring Cloud Azure 7.5.0. Region `australiaeast` by default.
 
+**Result: it works.** Deployed to a real AKS cluster, the service produced to and consumed from Event Hubs with no
+secret anywhere, over a private endpoint, and the negative test showed that workload identity is what makes it work.
+See [Results](#results-first-live-deployment-2026-11-26).
+
 Layout: `app/` (the service), `infra/` (Bicep), `k8s/` (manifests), `scripts/` (deploy, smoke test, destroy and
-their local tests), `.scratch/eventhubs-passwordless-poc/` (spec and tickets).
+their local tests).
 
 ## Prerequisites
 
@@ -81,8 +85,9 @@ These prove the consumer, buffer, SSE, clear, diagnostics and script logic. They
 
 ## Fallback: Spring Boot 3.5.x with Spring Cloud Azure 6.6.0
 
-If Azure's callback handler turns out incompatible with the Kafka 4.2.x client that Boot 4.1.2 brings, move to the
-older line. In `app/pom.xml`:
+**Not needed:** Azure's callback handler works with the Kafka 4.2.2 client that Boot 4.1.2 brings (see Results). These
+steps are kept for anyone who hits an incompatibility on other versions. They were written from the dependency
+differences and have **not been exercised**. To move to the older line, in `app/pom.xml`:
 
 1. Parent `spring-boot-starter-parent` to a 3.5.x release; `spring-cloud-azure.version` to `6.6.0`.
 2. Replace `spring-boot-starter-webmvc` with `spring-boot-starter-web`, and `spring-boot-starter-kafka` with plain
@@ -98,23 +103,70 @@ older line. In `app/pom.xml`:
 5. Verify: `cd app; ./mvnw package` (the round-trip test must pass), then redeploy and run the smoke test. The
    configuration in `application.yml` and the Kubernetes and Bicep files do not change.
 
-Record the outcome either way (worked, failed, caveats, fallback taken) at the end of the PoC (ticket 08).
+## Results: first live deployment (2026-11-26)
 
-## Status: built and locally validated, NOT yet deployed
+**Verdict: it worked.** Spring Kafka authenticated to Azure Event Hubs with no password, connection string or SAS key,
+using an AKS workload identity, for both the producer and the consumer, over a private endpoint.
 
-Nothing has been deployed to Azure. Built and checked locally only: the app compiles and its tests pass, the Bicep
-templates build and lint, scripts parse, and the smoke-test logic passes against fakes. **Unverified until a real
-deployment** (the spec's risks, plus ones added since):
+Deployed to `australiaeast` (Visual Studio Professional subscription): AKS 1.36 on one `Standard_D2s_v5` node,
+Standard-tier Event Hubs (1 TU), Basic ACR. Versions used: Java 21, Spring Boot 4.1.2, Spring Cloud Azure 7.5.0,
+spring-kafka 4.1.2, kafka-clients 4.2.2, azure-identity 1.19.0. **The Boot 3.5.x fallback was not needed.**
 
-- Azure's OAUTHBEARER callback handler working with the Kafka 4.2.x client.
-- Whether offset commits need more than the Event Hubs Data Receiver role.
-- Token refresh behaviour over a long-running connection.
-- Role-assignment propagation time (up to about five minutes), and the retry budget being enough.
-- Private DNS resolving the public namespace name to the private IP from inside the pod.
-- The pod hardening in `k8s/20-deployment.yaml`: read-only root filesystem with `/tmp` writable, non-root user
-  10001, no mounted API token (the workload identity webhook should still project its own token volume), and the
-  1Gi memory limit being enough. It was checked locally only by running the jar with a write-protected working
-  directory.
-- `az acr build` being allowed on the subscription, and AKS/Event Hubs quota in the region.
+### The three success criteria
 
-Treat any success claim as unproven until `scripts/smoke-test.ps1` passes against a live deployment.
+1. **Round trip through Event Hubs.** An event sent with `POST /api/events` was acknowledged by Event Hubs (partition
+   and offset returned), then came back through the consumer in `GET /api/events` and over the SSE stream.
+2. **No secret anywhere.** The namespace has `disableLocalAuth=true`, so key/SAS access is impossible. The identity
+   holds only Event Hubs Data Sender and Data Receiver, scoped to the single event hub. The `poc` namespace has no
+   Kubernetes secrets, and the app config has no credential properties.
+3. **Private networking and the right auth, visible from inside the pod.** `/api/diagnostics` reports
+   `OAUTHBEARER` over `SASL_SSL` with Spring Cloud Azure's `KafkaOAuth2AuthenticateCallbackHandler`, the passwordless
+   auto-configuration applied, and the Event Hubs host resolving to a private `10.0.4.x` address.
+
+### Test evidence
+
+- `scripts/smoke-test.ps1` against the live deployment: **19 of 19 assertions passed** (HTTP round trip, SSE,
+  diagnostics, clear, and the Azure resource checks).
+- `scripts/smoke-test.ps1 -NegativeTest`: **16 of 16 passed.** With the federated credential's subject changed so it
+  cannot match, a send returned HTTP 503 `reason=authentication` and the consumer had no partitions (last error
+  `KafkaException <- LoginException`). After restoring the credential, the round trip recovered within 8 seconds.
+  This shows workload identity is what makes it work. Entra honoured the change about 43 seconds after it was made,
+  and only after the pod restarted (a token already issued stays valid until it expires, so restarting the pod is
+  what forces a new token exchange).
+- Local checks: `./mvnw package` (63 tests), the smoke-test harness (59 scenarios) and the `deploy.ps1` helper tests.
+
+### How the earlier unknowns turned out
+
+| Risk | Outcome |
+| --- | --- |
+| Azure's OAUTHBEARER handler with the Kafka 4.2.x client | Works with kafka-clients 4.2.2. |
+| Offset commits needing more than Data Receiver | They don't. A probe event sent while the restarted consumer still had no partitions was acknowledged, then delivered once it joined. With `auto-offset-reset=latest` that only happens if the group resumed from a committed offset. |
+| Token refresh over a long-running connection | **Not observed.** Each pod instance ran for well under an hour (the pod was restarted several times during testing), which is shorter than a typical Entra access token lifetime, so no token expired mid-connection. Locally, with a fake short-lived credential, Kafka's refresh thread did re-invoke Azure's handler. Leave the PoC running for a couple of hours and re-run `smoke-test.ps1` if you want to see a real refresh. |
+| Role-assignment propagation (up to ~5 min) | **Not measured.** The first send succeeded on the first attempt, but the role assignment had been created many minutes earlier (AKS creation and the image build ran in between). |
+| Private DNS to the private IP from inside the pod | Works: the namespace name resolves to the private endpoint address. |
+| Pod hardening (read-only root FS, non-root, no mounted API token, 1Gi limit) | Works. The pod has run with 0 restarts, uses about 245Mi of the 1Gi limit, and the workload identity webhook still projects its own token volume. |
+| `az acr build` allowed on the subscription | Yes, on this subscription. |
+| Boot 4 Kafka starter name | `spring-boot-starter-kafka`, plus `spring-cloud-azure-starter` (there is no Kafka-specific Azure starter). |
+
+### Bugs the live run found (both fixed)
+
+Both had passed every local test, because the fakes did not model them:
+
+- `deploy.ps1` called `az acr build` with `--file Dockerfile` and an absolute source path. The Azure CLI resolves
+  `--file` against the current directory, so it failed with "Unable to find 'Dockerfile'". It now runs from the `app`
+  directory with `.` as the source.
+- `smoke-test.ps1` never saw the app as ready. PowerShell returns the body as bytes for Spring Boot's
+  `application/vnd.spring-boot.actuator.v3+json` type, so the JSON was never parsed. It now decodes the bytes, and the
+  test fake serves that content type.
+
+### Caveats
+
+- This is a PoC: no TLS or login on the dashboard (access control is the source-IP allow-list), one replica, no
+  autoscaling.
+- The container registry is public (Basic tier), and the AKS API server is public but restricted to your IP. Only the
+  Event Hubs path is fully private.
+- "Clear view" empties the dashboard's in-memory buffer only. Event Hubs keeps events until retention (1 day) expires.
+- Not tested: `destroy.ps1`, a change of your public IP between runs, and any test that the load balancer rejects
+  other source IPs (that would need a second network).
+- The environment is left running after the tests. It costs a little each day, so run `scripts/destroy.ps1` when you
+  are done.
